@@ -700,3 +700,11 @@ log("Battery manager initialized", 3)
 if eco_mode_enabled
   log("Eco mode is active", 3)
 end
+
+var SCRIPT_VERSION = "1.0.0"
+
+# Register version command
+tasmota.add_cmd("ScriptVersion", def(cmd, idx, payload, payload_json)
+  tasmota.resp_cmnd({"ScriptVersion": SCRIPT_VERSION})
+end)
+
