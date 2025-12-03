@@ -44,7 +44,7 @@ ensure_backlog()
 
 var SCRIPT_VERSION = "1.0.0"
 
-tasmota.add_cmd("ScriptVersion", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("ScriptVersion", def(cmd, idx, p, pj)
   var payload = {"ScriptVersion": SCRIPT_VERSION}
   tasmota.resp_cmnd(json.dump(payload))
 end)
