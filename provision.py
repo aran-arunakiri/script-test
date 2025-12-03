@@ -1,92 +1,59 @@
 import json
 import subprocess
 import time
+from typing import Optional, List
+
 import requests
+
+# -------- Configurable constants --------
 
 FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
 BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
-TASMOTA_IP = "192.168.4.1"
 
+TASMOTA_AP_SSID = "accusaver-3FCAD739"
+TASMOTA_AP_IP = "192.168.4.1"
+TASMOTA_HOSTNAME = "accusaver-3FCAD739"  # Hostname once on LAN
+
+EXPECTED_FIRMWARE_DATE = "2025-11-16T15:13:02"
+EXPECTED_SCRIPT_VERSION = "1.0.0"
+
+WIFI_INTERFACE = "wlan0"          # Pi Wi-Fi interface
+LAN_SUBNET_PREFIX = "192.168.0."  # <-- adjust to your router subnet
+SCAN_START_HOST = 1
+SCAN_END_HOST = 254
+
+IP_DISCOVERY_ORDER: List[str] = ["scan", "mdns"]
+
+
+# -------- Helpers --------
 
 def load_config():
+    """
+    .wifi-config.json:
+    {
+      "ssid": "YourRouterSSID",
+      "password": "YourRouterPassword"
+    }
+    """
     with open(".wifi-config.json", "r") as f:
         return json.load(f)
 
 
-TASMOTA_AP_SSID = "accusaver-3FCAD739"
-WIFI_INTERFACE = "en0"
-
-
-def connect_to_tasmota_ap():
-    """Attempt to connect to a Tasmota AP. Returns True if successful."""
-    result = subprocess.run(
-        ["networksetup", "-setairportnetwork", WIFI_INTERFACE, TASMOTA_AP_SSID],
+def run_cmd(cmd) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
         capture_output=True,
         text=True,
     )
 
-    # Give it a moment to connect
-    time.sleep(2)
 
-    # Check if we're connected by trying to reach the device
-    try:
-        response = subprocess.run(
-            [
-                "curl",
-                "-s",
-                "-o",
-                "/dev/null",
-                "-w",
-                "%{http_code}",
-                "--connect-timeout",
-                "3",
-                "http://192.168.4.1",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        return response.stdout.strip() == "200"
-    except:
-        return False
-
-
-def provision_device(wifi_ssid, wifi_password):
-    """Send provisioning commands to Tasmota device. Returns True if successful."""
-    
-    # Build the backlog command - all in one
-    commands = f"Backlog SSID1 {wifi_ssid}; Password1 {wifi_password}; OtaUrl {FIRMWARE_URL}; UrlFetch {BERRY_SCRIPT_URL}; Upgrade 1"
-    
-    try:
-        response = requests.get(
-            f"http://{TASMOTA_IP}/cm",
-            params={"cmnd": commands},
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            print(f"  ✓ Provisioning command sent")
-            return True
-        else:
-            print(f"  ✗ HTTP {response.status_code}")
-            return False
-            
-    except requests.exceptions.RequestException as e:
-        print(f"  ✗ Request failed: {e}")
-        return False
-
-
-if __name__ == "__main__":
-    config = load_config()
-    print(f"Target network: {config['ssid']}")
-
-    print(f"\nAttempting to connect to {TASMOTA_AP_SSID}...")
-    if connect_to_tasmota_ap():
-        print("✓ Connected and Tasmota reachable!")
-
-        print("\nSending provisioning commands...")
-        if provision_device(config["ssid"], config["password"]):
-            print("✓ Device provisioned!")
-        else:
-            print("✗ Provisioning failed")
-    else:
-        print("✗ Could not connect or reach Tasmota")
+def get_current_ip(interface: str) -> Optional[str]:
+    result = run_cmd(["ip", "-4", "addr", "show", interface])
+    out = result.stdout
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            # inet 192.168.4.2/24 brd ...
+            ip = line.split()[1].split("/")[0]
+            return ip
+    return None
