@@ -1,7 +1,7 @@
 import json
 import subprocess
 import time
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -12,21 +12,24 @@ BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test
 
 TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"
-TASMOTA_HOSTNAME = "accusaver-3FCAD739"  # Hostname once on LAN
+TASMOTA_HOSTNAME = (
+    "accusaver-3FCAD739"  # (AP hostname, LAN hostname will be 'accusaver' on new fw)
+)
 
 EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
 EXPECTED_SCRIPT_VERSION = "1.0.0"
 
 WIFI_INTERFACE = "wlan0"  # Pi Wi-Fi interface (AP side)
-LAN_INTERFACE = "eth0"  # <-- interface used to reach your router/LAN
+LAN_INTERFACE = "eth0"  # interface used to reach your router/LAN
 
 SCAN_START_HOST = 1
 SCAN_END_HOST = 254
 
-# For speed you can use ["mdns", "scan"]
+# LAN discovery: "scan" or "mdns" or both
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-MAX_DEVICES = 18  # how many successfully provisioned devices before stopping
+# For testing batch of 4 – later you can bump this to 18
+MAX_DEVICES = 5
 
 # -------- Helpers --------
 
@@ -168,7 +171,7 @@ def ensure_ap_http(max_attempts: int = 5) -> bool:
     return False
 
 
-# -------- Phase 1: AP-side provisioning --------
+# -------- Phase 1: AP-side provisioning (WiFi creds + OtaUrl) --------
 
 
 def send_phase1_commands(router_ssid: str, router_password: str, max_retries=3) -> bool:
@@ -246,22 +249,24 @@ def find_device_ip_by_hostname(
     return None
 
 
-def find_device_ip_by_scan(
+def find_all_devices_by_scan(
     subnet_prefix: str,
     start_host: int = 1,
     end_host: int = 254,
     timeout_seconds: float = 0.3,
     max_workers: int = 32,
-) -> Optional[str]:
+) -> Dict[str, str]:
     """
-    Strategy: "scan"
-    Parallel scan subnet_prefix.X using Status 5 on each IP.
+    Scan subnet_prefix.X using Status 5 on each IP.
+    Return dict ip -> hostname for all AccuSaver/Tasmota-like devices.
     """
     print(
         f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)"
     )
 
-    def probe(host: int) -> Optional[str]:
+    found: Dict[str, str] = {}
+
+    def probe(host: int) -> Optional[Tuple[str, str]]:
         ip = f"{subnet_prefix}{host}"
         url = f"http://{ip}/cm"
         try:
@@ -275,10 +280,8 @@ def find_device_ip_by_scan(
                     data.get("StatusNET", {}).get("IPAddress", "")
                 ).strip()
                 if hostname.startswith("accusaver") or hostname.startswith("tasmota"):
-                    print(
-                        f"  ✓ Found candidate at {ip} (Hostname={hostname}, IP={ip_reported})"
-                    )
-                    return ip_reported or ip
+                    real_ip = ip_reported or ip
+                    return (real_ip, hostname)
         except Exception:
             pass
         return None
@@ -291,35 +294,17 @@ def find_device_ip_by_scan(
         for future in as_completed(futures):
             result = future.result()
             if result:
-                print("[scan] Device found, cancelling remaining probes")
-                for f in futures:
-                    f.cancel()
-                return result
+                ip, hostname = result
+                found[ip] = hostname
 
-    print("  ✗ scan-based IP discovery failed")
-    return None
+    if found:
+        print(f"[scan] Found {len(found)} AccuSaver/Tasmota device(s) on LAN")
+        for ip, hostname in found.items():
+            print(f"  - {ip} ({hostname})")
+    else:
+        print("  ✗ scan-based IP discovery found no devices")
 
-
-def resolve_device_ip(order: List[str], subnet_prefix: str) -> Optional[str]:
-    """
-    Try IP discovery strategies in the given order.
-    order elements: "scan", "mdns"
-    """
-    for method in order:
-        if method == "scan":
-            ip = find_device_ip_by_scan(subnet_prefix, SCAN_START_HOST, SCAN_END_HOST)
-        elif method == "mdns":
-            ip = find_device_ip_by_hostname(TASMOTA_HOSTNAME)
-        else:
-            print(f"[IP discovery] Unknown method: {method}")
-            ip = None
-
-        if ip:
-            print(f"[IP discovery] Resolved device IP via {method}: {ip}")
-            return ip
-
-    print("[IP discovery] All strategies failed")
-    return None
+    return found
 
 
 # -------- Phase 2: LAN-side script fetch + upgrade --------
@@ -328,7 +313,12 @@ def resolve_device_ip(order: List[str], subnet_prefix: str) -> Optional[str]:
 def send_script_fetch(device_ip: str, max_retries=3) -> bool:
     """
     Phase 2a (LAN): UrlFetch <BERRY_SCRIPT_URL> only.
-    Failure is fatal in this single-purpose upgrade script.
+
+    We only treat this as success if the device replies with:
+        {"UrlFetch": "Done"}
+
+    Any other result (including "Failed", missing field, bad JSON, or
+    network errors) will be retried up to max_retries, then we abort.
     """
     if not BERRY_SCRIPT_URL:
         print("[Phase 2a] No BERRY_SCRIPT_URL set, skipping UrlFetch")
@@ -336,25 +326,54 @@ def send_script_fetch(device_ip: str, max_retries=3) -> bool:
 
     url = f"http://{device_ip}/cm"
     commands = f"UrlFetch {BERRY_SCRIPT_URL}"
-    print(f"[Phase 2a] Sending UrlFetch to {url}")
+    print(f"[Phase 2a] ({device_ip}) Sending UrlFetch")
+
     for attempt in range(1, max_retries + 1):
-        print(f"  UrlFetch attempt {attempt}/{max_retries}...")
+        print(f"  ({device_ip}) UrlFetch attempt {attempt}/{max_retries}...")
         try:
             resp = requests.get(url, params={"cmnd": commands}, timeout=15)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = resp.text
-                print(f"  ✓ UrlFetch HTTP 200, response: {data}")
-                return True
-            else:
-                print(f"  ✗ HTTP {resp.status_code} during UrlFetch")
         except Exception as e:
-            print(f"  ✗ UrlFetch request failed: {e}")
-        if attempt < max_retries:
-            print("  Retrying UrlFetch in 3 seconds...")
-            time.sleep(3)
+            print(f"  ✗ ({device_ip}) UrlFetch request failed: {e}")
+            if attempt < max_retries:
+                print(f"  ({device_ip}) Retrying UrlFetch in 3 seconds...")
+                time.sleep(3)
+            continue
+
+        if resp.status_code != 200:
+            print(
+                f"  ✗ ({device_ip}) HTTP {resp.status_code} during UrlFetch, body={resp.text!r}"
+            )
+            if attempt < max_retries:
+                print(f"  ({device_ip}) Retrying UrlFetch in 3 seconds...")
+                time.sleep(3)
+            continue
+
+        # HTTP 200 – parse JSON and inspect UrlFetch result
+        try:
+            data = resp.json()
+        except Exception:
+            print(f"  ✗ ({device_ip}) UrlFetch: invalid JSON response: {resp.text!r}")
+            if attempt < max_retries:
+                print(f"  ({device_ip}) Retrying UrlFetch in 3 seconds...")
+                time.sleep(3)
+            continue
+
+        result = data.get("UrlFetch")
+        print(f"  ✓ ({device_ip}) UrlFetch HTTP 200, response: {data}")
+
+        if result == "Done":
+            # Only here do we consider UrlFetch successful.
+            return True
+        else:
+            print(f"  ✗ ({device_ip}) UrlFetch result {result!r}, " f"expected 'Done'.")
+            if attempt < max_retries:
+                print(f"  ({device_ip}) Retrying UrlFetch in 3 seconds...")
+                time.sleep(3)
+            # else fall through and fail.
+
+    print(
+        f"✗ ({device_ip}) UrlFetch failed after {max_retries} attempts, aborting this device."
+    )
     return False
 
 
@@ -365,9 +384,9 @@ def send_upgrade(device_ip: str, max_retries=3) -> bool:
     """
     url = f"http://{device_ip}/cm"
     commands = "Upgrade 1"
-    print(f"[Phase 2b] Sending Upgrade 1 to {url}")
+    print(f"[Phase 2b] ({device_ip}) Sending Upgrade 1")
     for attempt in range(1, max_retries + 1):
-        print(f"  Upgrade attempt {attempt}/{max_retries}...")
+        print(f"  ({device_ip}) Upgrade attempt {attempt}/{max_retries}...")
         try:
             resp = requests.get(url, params={"cmnd": commands}, timeout=15)
             if resp.status_code == 200:
@@ -375,14 +394,14 @@ def send_upgrade(device_ip: str, max_retries=3) -> bool:
                     data = resp.json()
                 except Exception:
                     data = resp.text
-                print(f"  ✓ Upgrade HTTP 200, response: {data}")
+                print(f"  ✓ ({device_ip}) Upgrade HTTP 200, response: {data}")
                 return True
             else:
-                print(f"  ✗ HTTP {resp.status_code} during Upgrade 1")
+                print(f"  ✗ ({device_ip}) HTTP {resp.status_code} during Upgrade 1")
         except Exception as e:
-            print(f"  ✗ Upgrade request failed: {e}")
+            print(f"  ✗ ({device_ip}) Upgrade request failed: {e}")
         if attempt < max_retries:
-            print("  Retrying Upgrade in 5 seconds...")
+            print(f"  ({device_ip}) Retrying Upgrade in 5 seconds...")
             time.sleep(5)
     return False
 
@@ -396,10 +415,10 @@ def wait_for_script_after_safeboot(
     """
     Poll ScriptVersion until safeboot has completed and the Berry script is installed.
     """
-    print("[Safeboot] Waiting for safeboot to complete...")
+    print(f"[Safeboot] ({ip}) Waiting for safeboot to complete...")
 
     for attempt in range(1, max_attempts + 1):
-        print(f"  ScriptVersion check {attempt}/{max_attempts}...")
+        print(f"  ({ip}) ScriptVersion check {attempt}/{max_attempts}...")
         try:
             resp = requests.get(
                 f"http://{ip}/cm",
@@ -411,19 +430,19 @@ def wait_for_script_after_safeboot(
                 version = str(data.get("ScriptVersion", "")).strip()
                 if version:
                     print(
-                        f"    ScriptVersion: {version} (expected: {expected_version})"
+                        f"    ({ip}) ScriptVersion: {version} (expected: {expected_version})"
                     )
                     if version == expected_version:
-                        print("  ✓ ScriptVersion matches, safeboot complete!")
+                        print(f"  ✓ ({ip}) ScriptVersion matches, safeboot complete!")
                         return True
             else:
-                print(f"    HTTP {resp.status_code} from ScriptVersion")
+                print(f"    ({ip}) HTTP {resp.status_code} from ScriptVersion")
         except Exception as e:
-            print(f"    ScriptVersion request error: {e}")
+            print(f"    ({ip}) ScriptVersion request error: {e}")
 
         time.sleep(delay_seconds)
 
-    print("  ✗ Timeout waiting for ScriptVersion")
+    print(f"  ✗ ({ip}) Timeout waiting for ScriptVersion")
     return False
 
 
@@ -431,33 +450,33 @@ def wait_for_script_after_safeboot(
 
 
 def send_reset4(ip: str) -> bool:
-    print("[Reset 4] Sending Reset 4 (activate firmware, keep WiFi)")
+    print(f"[Reset 4] ({ip}) Sending Reset 4 (activate firmware, keep WiFi)")
     try:
         requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 4"}, timeout=5)
-        print("  ✓ Reset 4 sent")
+        print(f"  ✓ ({ip}) Reset 4 sent")
         return True
     except Exception as e:
-        print(f"  ✗ Failed to send Reset 4: {e}")
+        print(f"  ✗ ({ip}) Failed to send Reset 4: {e}")
         return False
 
 
 def send_reset1(ip: str) -> bool:
-    print("[Reset 1] Sending Reset 1 (factory reset)")
+    print(f"[Reset 1] ({ip}) Sending Reset 1 (factory reset)")
     try:
         requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 1"}, timeout=5)
-        print("  ✓ Reset 1 sent")
+        print(f"  ✓ ({ip}) Reset 1 sent")
         return True
     except Exception as e:
-        print(f"  ✗ Failed to send Reset 1: {e}")
+        print(f"  ✗ ({ip}) Failed to send Reset 1: {e}")
         return False
 
 
 def wait_for_device_online(
     ip: str, max_attempts: int = 20, delay_seconds: int = 3
 ) -> bool:
-    print("[Online check] Waiting for device to come back online...")
+    print(f"[Online check] ({ip}) Waiting for device to come back online...")
     for attempt in range(1, max_attempts + 1):
-        print(f"  Status 0 check {attempt}/{max_attempts}...")
+        print(f"  ({ip}) Status 0 check {attempt}/{max_attempts}...")
         try:
             resp = requests.get(
                 f"http://{ip}/cm",
@@ -465,13 +484,13 @@ def wait_for_device_online(
                 timeout=5,
             )
             if resp.status_code == 200:
-                print("  ✓ Device is back online")
+                print(f"  ✓ ({ip}) Device is back online")
                 return True
         except Exception:
             pass
         time.sleep(delay_seconds)
 
-    print("  ✗ Timeout waiting for device")
+    print(f"  ✗ ({ip}) Timeout waiting for device")
     return False
 
 
@@ -479,7 +498,7 @@ def wait_for_device_online(
 
 
 def verify_firmware(ip: str) -> bool:
-    print("[Verify] Verifying firmware...")
+    print(f"[Verify] ({ip}) Verifying firmware...")
     try:
         resp = requests.get(
             f"http://{ip}/cm",
@@ -487,21 +506,21 @@ def verify_firmware(ip: str) -> bool:
             timeout=10,
         )
         if resp.status_code != 200:
-            print(f"  ✗ Status 2 HTTP {resp.status_code}")
+            print(f"  ✗ ({ip}) Status 2 HTTP {resp.status_code}")
             return False
 
         data = resp.json()
         build_date = str(data.get("StatusFWR", {}).get("BuildDateTime", "")).strip()
         ok = build_date == EXPECTED_FIRMWARE_DATE
-        print(f"  Firmware BuildDateTime: {build_date} {'✓' if ok else '✗'}")
+        print(f"  ({ip}) Firmware BuildDateTime: {build_date} {'✓' if ok else '✗'}")
         return ok
     except Exception as e:
-        print(f"  ✗ Firmware verification failed: {e}")
+        print(f"  ✗ ({ip}) Firmware verification failed: {e}")
         return False
 
 
 def verify_script(ip: str) -> bool:
-    print("[Verify] Verifying Berry script...")
+    print(f"[Verify] ({ip}) Verifying Berry script...")
     try:
         resp = requests.get(
             f"http://{ip}/cm",
@@ -509,202 +528,254 @@ def verify_script(ip: str) -> bool:
             timeout=10,
         )
         if resp.status_code != 200:
-            print(f"  ✗ ScriptVersion HTTP {resp.status_code}")
+            print(f"  ✗ ({ip}) ScriptVersion HTTP {resp.status_code}")
             return False
 
         data = resp.json()
         version = str(data.get("ScriptVersion", "")).strip()
         ok = version == EXPECTED_SCRIPT_VERSION
-        print(f"  Script version: {version} {'✓' if ok else '✗'}")
+        print(f"  ({ip}) Script version: {version} {'✓' if ok else '✗'}")
         return ok
     except Exception as e:
-        print(f"  ✗ Script verification failed: {e}")
+        print(f"  ✗ ({ip}) Script verification failed: {e}")
         return False
 
+
+# -------- Phase B per-device worker (LAN) --------
+
+
+def provision_device_on_lan(ip: str) -> Tuple[str, bool, float]:
+    """
+    Full LAN-side flow for a single device, run in a thread.
+    Returns (ip, success, elapsed_seconds).
+    """
+    start = time.time()
+    success = False
+    try:
+        # STEP B1: UrlFetch script
+        print(f"\n[LAN worker] ({ip}) Starting LAN provisioning...")
+        if not send_script_fetch(ip):
+            print(f"[LAN worker] ({ip}) UrlFetch failed, aborting this device")
+            return ip, False, time.time() - start
+
+        # STEP B2: Upgrade 1 (firmware OTA)
+        if not send_upgrade(ip):
+            print(f"[LAN worker] ({ip}) Upgrade failed, aborting this device")
+            return ip, False, time.time() - start
+
+        # STEP B3: Wait for safeboot / ScriptVersion
+        time.sleep(10)  # initial grace period
+        if not wait_for_script_after_safeboot(ip, EXPECTED_SCRIPT_VERSION):
+            print(f"[LAN worker] ({ip}) Safeboot / script install failed")
+            return ip, False, time.time() - start
+
+        # STEP B4: Reset 4 and wait online
+        if not send_reset4(ip):
+            print(f"[LAN worker] ({ip}) Reset 4 failed")
+            return ip, False, time.time() - start
+
+        time.sleep(5)
+        if not wait_for_device_online(ip):
+            print(f"[LAN worker] ({ip}) Device did not come back after Reset 4")
+            return ip, False, time.time() - start
+
+        # STEP B5: Verification
+        fw_ok = verify_firmware(ip)
+        script_ok = verify_script(ip)
+        if not (fw_ok and script_ok):
+            print(f"[LAN worker] ({ip}) Verification failed")
+            return ip, False, time.time() - start
+
+        # STEP B6: Factory reset
+        send_reset1(ip)
+        success = True
+        return ip, True, time.time() - start
+
+    finally:
+        elapsed = time.time() - start
+        print(
+            f"[LAN worker] ({ip}) Finished with success={success}, elapsed={elapsed:.1f}s"
+        )
+
+
+# -------- Main --------
 
 if __name__ == "__main__":
     config = load_config()
     router_ssid = config["ssid"]
     router_password = config["password"]
 
-    print("=== MULTI-DEVICE MODE: Continuous provisioning ===\n")
+    script_start = time.time()
+
+    print("=== MULTI-DEVICE MODE (HORIZONTAL) ===\n")
     print(f"Target router SSID: {router_ssid}")
     print(f"IP discovery order: {IP_DISCOVERY_ORDER}")
-    print(f"Max devices to provision: {MAX_DEVICES}\n")
+    print(f"Batch size: {MAX_DEVICES}\n")
 
-    success_count = 0
-    provision_times: List[float] = []
-    total_attempts = 0
+    # ---------- PHASE A: AP provisioning for N devices ----------
 
-    while success_count < MAX_DEVICES:
-        total_attempts += 1
-        device_number = success_count + 1
+    ap_start = time.time()
+    ap_provisioned = 0
+    ap_durations: List[float] = []
+
+    while ap_provisioned < MAX_DEVICES:
+        device_number = ap_provisioned + 1
         print("\n==============================================")
-        print(f" Ready for device #{device_number} of {MAX_DEVICES}")
+        print(f" PHASE A: Ready for device #{device_number} of {MAX_DEVICES}")
         print(" Power on the next AccuSaver device now.")
         print("==============================================\n")
 
-        device_start = time.time()
+        device_ap_start = time.time()
 
-        # STEP 1: Connect to AP
-        print("=== STEP 1: Connect WiFi to AccuSaver AP ===")
-        step_start = time.time()
+        # Connect to AP
+        print("=== AP STEP: Connect WiFi to AccuSaver AP ===")
         while not connect_wifi_to_ap():
             print("✗ Could not connect to AP, retrying in 3 seconds...")
             time.sleep(3)
 
         if not ensure_ap_http():
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 1 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ AP unreachable, restarting whole loop...\n")
+            print("✗ AP unreachable, skipping this device...\n")
             continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 1 duration: {step_elapsed:.1f} seconds ---\n")
 
-        # STEP 2: Phase 1 - WiFi + OtaUrl
-        print("=== STEP 2: Phase 1 - Send WiFi credentials + OtaUrl ===")
-        step_start = time.time()
+        # Send WiFi creds + OtaUrl
+        print("\n=== AP STEP: Send WiFi credentials + OtaUrl ===")
         if not send_phase1_commands(router_ssid, router_password):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 2 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Phase 1 failed, restarting loop...\n")
+            print("✗ Phase 1 failed, skipping this device...\n")
             continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 2 duration: {step_elapsed:.1f} seconds ---\n")
 
-        # STEP 3: Wait for device to join home WiFi
-        print("=== STEP 3: Wait for device to join home WiFi ===")
-        step_start = time.time()
-        print("Waiting 3 seconds before LAN discovery...")
-        time.sleep(3)
-        # Clear wlan0 connection; device is now switching to home WiFi
+        # Small grace period so the device can process, then disconnect
+        print("\n=== AP STEP: Disconnect and move to next device ===")
+        time.sleep(2)
         disconnect_wifi()
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 3 duration: {step_elapsed:.1f} seconds ---\n")
 
-        # STEP 4: Discover device IP using chosen strategies (LAN side)
-        print("=== STEP 4: Discover device IP (LAN) ===")
-        step_start = time.time()
-        try:
-            lan_prefix = detect_lan_prefix(LAN_INTERFACE)
-        except RuntimeError as e:
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 4 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print(f"✗ {e}, restarting loop...\n")
-            continue
-
-        device_ip = None
-        max_discovery_attempts = 6
-        for attempt in range(1, max_discovery_attempts + 1):
-            print(f"  LAN discovery attempt {attempt}/{max_discovery_attempts}...")
-            device_ip = resolve_device_ip(IP_DISCOVERY_ORDER, lan_prefix)
-            if device_ip:
-                break
-            time.sleep(5)
-
-        if not device_ip:
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 4 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Device did not appear on the home network after retries.")
-            print(
-                "✗ Check router/DHCP leases or reset the device to re-enter AP mode.\n"
-            )
-            continue
-
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 4 duration: {step_elapsed:.1f} seconds ---\n")
-
-        # STEP 5: Phase 2a - UrlFetch (script)
-        print("=== STEP 5: Phase 2a - UrlFetch (script fetch) ===")
-        step_start = time.time()
-        if not send_script_fetch(device_ip):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 5 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ UrlFetch failed in upgrade mode, restarting loop...\n")
-            continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 5 duration: {step_elapsed:.1f} seconds ---\n")
-
-        # STEP 6: Phase 2b - Upgrade 1 (firmware OTA)
-        print("=== STEP 6: Phase 2b - Upgrade 1 (firmware OTA) ===")
-        step_start = time.time()
-        if not send_upgrade(device_ip):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 6 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Upgrade 1 failed, restarting loop...\n")
-            continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 6 duration: {step_elapsed:.1f} seconds ---\n")
-
-        # STEP 7: Wait for safeboot / ScriptVersion
-        print("=== STEP 7: Wait for safeboot / ScriptVersion ===")
-        step_start = time.time()
-        time.sleep(10)
-        if not wait_for_script_after_safeboot(device_ip, EXPECTED_SCRIPT_VERSION):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 7 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Safeboot / Berry script installation failed, restarting loop...\n")
-            continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 7 duration: {step_elapsed:.1f} seconds ---\n")
-
-        # STEP 8: Reset 4 and wait online
-        print("=== STEP 8: Reset 4 and wait for device online ===")
-        step_start = time.time()
-        if not send_reset4(device_ip):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 8 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Reset 4 failed, restarting loop...\n")
-            continue
-
-        time.sleep(5)
-        if not wait_for_device_online(device_ip):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 8 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Device offline after Reset 4, restarting loop...\n")
-            continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 8 duration: {step_elapsed:.1f} seconds ---\n")
-
-        # STEP 9: Verification
-        print("=== STEP 9: Verify firmware and script ===")
-        step_start = time.time()
-        fw_ok = verify_firmware(device_ip)
-        script_ok = verify_script(device_ip)
-        if not (fw_ok and script_ok):
-            step_elapsed = time.time() - step_start
-            print(f"--- STEP 9 duration: {step_elapsed:.1f} seconds (failed) ---\n")
-            print("✗ Verification failed, restarting loop...\n")
-            continue
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 9 duration: {step_elapsed:.1f} seconds ---\n")
-
-        # STEP 10: Reset 1 (factory reset)
-        print("=== STEP 10: Factory reset (Reset 1) ===")
-        step_start = time.time()
-        send_reset1(device_ip)
-        step_elapsed = time.time() - step_start
-        print(f"--- STEP 10 duration: {step_elapsed:.1f} seconds ---\n")
-
-        success_count += 1
-        device_elapsed = time.time() - device_start
-        provision_times.append(device_elapsed)
+        device_ap_elapsed = time.time() - device_ap_start
+        ap_durations.append(device_ap_elapsed)
+        ap_provisioned += 1
 
         print("\n==============================================================")
-        print(f"✓ SUCCESS: {device_ip} fully provisioned and factory-reset!")
-        print(f"  Provisioned devices: {success_count}/{MAX_DEVICES}")
-        print(f"  Device #{device_number} total time: {device_elapsed:.1f} seconds")
+        print(f"✓ PHASE A SUCCESS: Device #{device_number} AP-provisioned")
+        print(
+            f"  AP provisioning time for this device: {device_ap_elapsed:.1f} seconds"
+        )
+        print(f"  AP-provisioned devices: {ap_provisioned}/{MAX_DEVICES}")
         print("==============================================================\n")
 
-    print("\nAll done!")
-    print(f"{success_count} device(s) successfully provisioned.")
+    total_ap_time = time.time() - ap_start
+    print("=== PHASE A COMPLETE ===")
+    print(f"Total AP provisioning time: {total_ap_time:.1f} seconds")
+    if ap_durations:
+        avg_ap = sum(ap_durations) / len(ap_durations)
+        print(f"Average AP time per device: {avg_ap:.1f} seconds\n")
 
-    failed_attempts = total_attempts - success_count
-    if failed_attempts > 0:
-        print(f"{failed_attempts} provisioning attempt(s) failed before success.")
+    # ---------- PHASE B: LAN batch upgrade & verify ----------
 
-    if provision_times:
-        avg_time = sum(provision_times) / len(provision_times)
-        print(
-            f"Average provision time per device (successful only): {avg_time:.1f} seconds"
+    print("\n=== PHASE B: Discover devices on LAN and upgrade in parallel ===\n")
+
+    try:
+        lan_prefix = detect_lan_prefix(LAN_INTERFACE)
+    except RuntimeError as e:
+        print(f"✗ {e}, cannot proceed with PHASE B.")
+        exit(1)
+
+    # Discover up to MAX_DEVICES devices whose hostname starts with 'accusaver'
+    lan_discovery_start = time.time()
+    devices_found: Dict[str, str] = {}
+    max_discovery_rounds = 12  # e.g. 12 * 5s = 60 seconds total
+    for round_idx in range(1, max_discovery_rounds + 1):
+        print(f"\n[LAN discovery] Round {round_idx}/{max_discovery_rounds}...")
+        scan_results = find_all_devices_by_scan(
+            lan_prefix, SCAN_START_HOST, SCAN_END_HOST
         )
+        # Filter hostnames starting with 'accusaver'
+        for ip, hostname in scan_results.items():
+            if hostname.startswith("accusaver"):
+                devices_found[ip] = hostname
+
+        print(
+            f"[LAN discovery] AccuSaver devices found so far: {len(devices_found)}/{MAX_DEVICES}"
+        )
+        for ip, hostname in devices_found.items():
+            print(f"  - {ip} ({hostname})")
+
+        if len(devices_found) >= MAX_DEVICES:
+            print("[LAN discovery] Found required number of devices on LAN.")
+            break
+
+        time.sleep(5)
+
+    lan_discovery_elapsed = time.time() - lan_discovery_start
+
+    if len(devices_found) == 0:
+        print("✗ No AccuSaver devices found on LAN. Cannot continue.")
+        exit(1)
+
+    if len(devices_found) < MAX_DEVICES:
+        print(
+            f"⚠ WARNING: Only {len(devices_found)} AccuSaver device(s) discovered on LAN,"
+        )
+        print(
+            f"  but batch expects {MAX_DEVICES}. Proceeding with discovered devices only.\n"
+        )
+
+    print(
+        f"\n=== PHASE B: LAN discovery complete in {lan_discovery_elapsed:.1f} seconds ==="
+    )
+    print("Devices to process:")
+    for ip, hostname in devices_found.items():
+        print(f"  - {ip} ({hostname})")
+    print()
+
+    lan_batch_start = time.time()
+    lan_results: List[Tuple[str, bool, float]] = []
+
+    # Use a thread pool to process devices in parallel (horizontalization)
+    with ThreadPoolExecutor(max_workers=min(len(devices_found), 8)) as executor:
+        future_map = {
+            executor.submit(provision_device_on_lan, ip): ip
+            for ip in devices_found.keys()
+        }
+
+        for future in as_completed(future_map):
+            ip = future_map[future]
+            try:
+                ip_result, success, elapsed = future.result()
+                lan_results.append((ip_result, success, elapsed))
+            except Exception as e:
+                print(f"[LAN worker] ({ip}) raised unexpected exception: {e}")
+                lan_results.append((ip, False, 0.0))
+
+    lan_batch_elapsed = time.time() - lan_batch_start
+
+    # ---------- Stats & summary ----------
+
+    total_success = sum(1 for _, ok, _ in lan_results if ok)
+    total_fail = len(lan_results) - total_success
+
+    print("\n=== BATCH SUMMARY ===")
+    print(f"Batch size (expected): {MAX_DEVICES}")
+    print(f"Devices discovered on LAN: {len(devices_found)}")
+    print(f"LAN workers executed: {len(lan_results)}")
+    print(f"  ✓ Success: {total_success}")
+    print(f"  ✗ Failed: {total_fail}\n")
+
+    for ip, success, elapsed in lan_results:
+        print(f"  Device {ip}: success={success}, LAN phase time={elapsed:.1f} seconds")
+
+    total_script_time = time.time() - script_start
+    print("\n=== TIMING SUMMARY ===")
+    print(f"Total script runtime (AP + LAN): {total_script_time:.1f} seconds")
+    if total_success > 0:
+        avg_total_per_device = total_script_time / total_success
+        print(
+            f"Average total time per successful device: {avg_total_per_device:.1f} seconds"
+        )
+
+    if ap_durations:
+        avg_ap = sum(ap_durations) / len(ap_durations)
+        print(f"Average AP-only time per device: {avg_ap:.1f} seconds")
+
+    if lan_results and total_success > 0:
+        avg_lan = sum(elapsed for _, ok, elapsed in lan_results if ok) / total_success
+        print(f"Average LAN-only time per successful device: {avg_lan:.1f} seconds")
+
+    print("\nDone.")
