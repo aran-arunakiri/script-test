@@ -14,11 +14,11 @@ TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"
 TASMOTA_HOSTNAME = "accusaver-3FCAD739"  # Hostname once on LAN
 
-EXPECTED_FIRMWARE_DATE = "2025-11-16T15:13:02"
+EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
 EXPECTED_SCRIPT_VERSION = "1.0.0"
 
-WIFI_INTERFACE = "wlan0"  # Pi Wi-Fi interface (AP side)
-LAN_INTERFACE = "eth0"  # <-- interface used to reach your router/LAN
+WIFI_INTERFACE = "wlan0"          # Pi Wi-Fi interface (AP side)
+LAN_INTERFACE = "eth0"            # <-- interface used to reach your router/LAN
 
 SCAN_START_HOST = 1
 SCAN_END_HOST = 254
@@ -29,7 +29,6 @@ IP_DISCOVERY_ORDER: List[str] = ["scan"]
 MAX_DEVICES = 4  # how many successfully provisioned devices before stopping
 
 # -------- Helpers --------
-
 
 def load_config():
     """
@@ -84,7 +83,6 @@ def detect_lan_prefix(interface: str) -> str:
 
 # -------- Wi-Fi / AP handling (Pi / Linux) --------
 
-
 def disconnect_wifi():
     print(f"[WiFi] Disconnecting {WIFI_INTERFACE}...")
     run_cmd(["nmcli", "device", "disconnect", WIFI_INTERFACE])
@@ -101,22 +99,28 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
     run_cmd(["nmcli", "device", "wifi", "rescan"])
     time.sleep(2)  # give the scan a moment
 
-    # Optional debug: list networks
+    # List networks
     scan_list = run_cmd(["nmcli", "-f", "SSID,CHAN,SIGNAL", "device", "wifi"])
-    print("  Available networks:\n", scan_list.stdout)
+    lines = scan_list.stdout.splitlines()
+
+    # Filter SSIDs starting with "accusaver-"
+    accusavers = [
+        line for line in lines
+        if line.strip().lower().startswith("accusaver")
+    ]
+
+    print("  Available networks:")
+    if accusavers:
+        for line in accusavers:
+            print(" ", line)
+    else:
+        print("  (no accusavers found)")
 
     print(f"[WiFi] Connecting {WIFI_INTERFACE} to SSID {TASMOTA_AP_SSID}...")
-    proc = run_cmd(
-        [
-            "nmcli",
-            "device",
-            "wifi",
-            "connect",
-            TASMOTA_AP_SSID,
-            "ifname",
-            WIFI_INTERFACE,
-        ]
-    )
+    proc = run_cmd([
+        "nmcli", "device", "wifi", "connect", TASMOTA_AP_SSID,
+        "ifname", WIFI_INTERFACE,
+    ])
     if proc.returncode != 0:
         print(f"  ✗ nmcli connect error: {proc.stderr.strip()}")
         return False
@@ -158,7 +162,6 @@ def ensure_ap_http(max_attempts: int = 5) -> bool:
 
 # -------- Phase 1: AP-side provisioning --------
 
-
 def send_phase1_commands(router_ssid: str, router_password: str, max_retries=3) -> bool:
     """
     Phase 1 (AP): send WiFi credentials + OtaUrl (no UrlFetch/Upgrade yet).
@@ -196,7 +199,6 @@ def send_phase1_commands(router_ssid: str, router_password: str, max_retries=3) 
 
 
 # -------- IP discovery strategies (LAN side) --------
-
 
 def find_device_ip_by_hostname(
     hostname: str,
@@ -245,27 +247,19 @@ def find_device_ip_by_scan(
     Strategy: "scan"
     Parallel scan subnet_prefix.X using Status 5 on each IP.
     """
-    print(
-        f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)"
-    )
+    print(f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)")
 
     def probe(host: int) -> Optional[str]:
         ip = f"{subnet_prefix}{host}"
         url = f"http://{ip}/cm"
         try:
-            resp = requests.get(
-                url, params={"cmnd": "Status 5"}, timeout=timeout_seconds
-            )
+            resp = requests.get(url, params={"cmnd": "Status 5"}, timeout=timeout_seconds)
             if resp.status_code == 200:
                 data = resp.json()
                 hostname = str(data.get("StatusNET", {}).get("Hostname", "")).lower()
-                ip_reported = str(
-                    data.get("StatusNET", {}).get("IPAddress", "")
-                ).strip()
+                ip_reported = str(data.get("StatusNET", {}).get("IPAddress", "")).strip()
                 if hostname.startswith("accusaver") or hostname.startswith("tasmota"):
-                    print(
-                        f"  ✓ Found candidate at {ip} (Hostname={hostname}, IP={ip_reported})"
-                    )
+                    print(f"  ✓ Found candidate at {ip} (Hostname={hostname}, IP={ip_reported})")
                     return ip_reported or ip
         except Exception:
             pass
@@ -311,7 +305,6 @@ def resolve_device_ip(order: List[str], subnet_prefix: str) -> Optional[str]:
 
 
 # -------- Phase 2: LAN-side script fetch + upgrade --------
-
 
 def send_script_fetch(device_ip: str, max_retries=3) -> bool:
     """
@@ -398,9 +391,7 @@ def wait_for_script_after_safeboot(
                 data = resp.json()
                 version = str(data.get("ScriptVersion", "")).strip()
                 if version:
-                    print(
-                        f"    ScriptVersion: {version} (expected: {expected_version})"
-                    )
+                    print(f"    ScriptVersion: {version} (expected: {expected_version})")
                     if version == expected_version:
                         print("  ✓ ScriptVersion matches, safeboot complete!")
                         return True
@@ -416,7 +407,6 @@ def wait_for_script_after_safeboot(
 
 
 # -------- Resets and online wait --------
-
 
 def send_reset4(ip: str) -> bool:
     print("[Reset 4] Sending Reset 4 (activate firmware, keep WiFi)")
@@ -440,9 +430,7 @@ def send_reset1(ip: str) -> bool:
         return False
 
 
-def wait_for_device_online(
-    ip: str, max_attempts: int = 20, delay_seconds: int = 3
-) -> bool:
+def wait_for_device_online(ip: str, max_attempts: int = 20, delay_seconds: int = 3) -> bool:
     print("[Online check] Waiting for device to come back online...")
     for attempt in range(1, max_attempts + 1):
         print(f"  Status 0 check {attempt}/{max_attempts}...")
@@ -464,7 +452,6 @@ def wait_for_device_online(
 
 
 # -------- Verification --------
-
 
 def verify_firmware(ip: str) -> bool:
     print("[Verify] Verifying firmware...")
@@ -547,8 +534,8 @@ if __name__ == "__main__":
 
         # STEP 3: Wait for device to join home WiFi
         print("\n=== STEP 3: Wait for device to join home WiFi ===")
-        print("Waiting 20 seconds before LAN discovery...")
-        time.sleep(20)
+        print("Waiting 10 seconds before LAN discovery...")
+        time.sleep(10)
 
         # OPTIONAL: free wlan0 again (keeps things clean)
         disconnect_wifi()
