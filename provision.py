@@ -3,15 +3,12 @@ import subprocess
 import time
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import argparse
+
 import requests
 
 # -------- Configurable constants --------
-
-# FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
-FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs_old.bin"
-# BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
-BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/old/autoexec.be"
+FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
+BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
 
 TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"
@@ -20,13 +17,16 @@ TASMOTA_HOSTNAME = "accusaver-3FCAD739"  # Hostname once on LAN
 EXPECTED_FIRMWARE_DATE = "2025-11-16T15:13:02"
 EXPECTED_SCRIPT_VERSION = "1.0.0"
 
-WIFI_INTERFACE = "wlan0"  # Pi Wi-Fi interface
-LAN_SUBNET_PREFIX = "192.168.0."  # <-- adjust to your router subnet
+WIFI_INTERFACE = "wlan0"  # Pi Wi-Fi interface (AP side)
+LAN_INTERFACE = "eth0"  # <-- interface used to reach your router/LAN
+
 SCAN_START_HOST = 1
 SCAN_END_HOST = 254
 
-IP_DISCOVERY_ORDER: List[str] = ["scan", "mdns"]
+# For speed you can use ["mdns", "scan"]
+IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
+MAX_DEVICES = 4  # how many successfully provisioned devices before stopping
 
 # -------- Helpers --------
 
@@ -63,6 +63,25 @@ def get_current_ip(interface: str) -> Optional[str]:
     return None
 
 
+def detect_lan_prefix(interface: str) -> str:
+    """
+    Detect the LAN subnet prefix for the given interface.
+    Example: if IP is 192.168.2.23 => returns '192.168.2.'
+    """
+    print(f"[LAN] Detecting LAN prefix on interface {interface}...")
+    result = run_cmd(["ip", "-4", "addr", "show", interface])
+    out = result.stdout
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("inet "):
+            ip = line.split()[1].split("/")[0]
+            parts = ip.split(".")
+            prefix = ".".join(parts[:3]) + "."
+            print(f"[LAN] Detected LAN prefix: {prefix}")
+            return prefix
+    raise RuntimeError(f"Could not detect LAN prefix on {interface}")
+
+
 # -------- Wi-Fi / AP handling (Pi / Linux) --------
 
 
@@ -74,8 +93,17 @@ def disconnect_wifi():
 def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
     """
     Use nmcli to connect wlan0 to the AccuSaver AP (open network).
+    Performs a WiFi rescan first to refresh AP visibility.
     """
     disconnect_wifi()
+
+    print(f"[WiFi] Scanning for {TASMOTA_AP_SSID}...")
+    run_cmd(["nmcli", "device", "wifi", "rescan"])
+    time.sleep(2)  # give the scan a moment
+
+    # Optional debug: list networks
+    scan_list = run_cmd(["nmcli", "-f", "SSID,CHAN,SIGNAL", "device", "wifi"])
+    print("  Available networks:\n", scan_list.stdout)
 
     print(f"[WiFi] Connecting {WIFI_INTERFACE} to SSID {TASMOTA_AP_SSID}...")
     proc = run_cmd(
@@ -134,7 +162,7 @@ def ensure_ap_http(max_attempts: int = 5) -> bool:
 def send_phase1_commands(router_ssid: str, router_password: str, max_retries=3) -> bool:
     """
     Phase 1 (AP): send WiFi credentials + OtaUrl (no UrlFetch/Upgrade yet).
-    Mirrors _sendPhase1Commands() in Flutter.
+    Mirrors _sendPhase1Commands() from Flutter.
     """
     commands = (
         f"Backlog0 OtaUrl {FIRMWARE_URL}; "
@@ -217,7 +245,6 @@ def find_device_ip_by_scan(
     Strategy: "scan"
     Parallel scan subnet_prefix.X using Status 5 on each IP.
     """
-
     print(
         f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)"
     )
@@ -252,7 +279,6 @@ def find_device_ip_by_scan(
         for future in as_completed(futures):
             result = future.result()
             if result:
-                # We found our device; cancel the rest
                 print("[scan] Device found, cancelling remaining probes")
                 for f in futures:
                     f.cancel()
@@ -262,16 +288,14 @@ def find_device_ip_by_scan(
     return None
 
 
-def resolve_device_ip(order: List[str]) -> Optional[str]:
+def resolve_device_ip(order: List[str], subnet_prefix: str) -> Optional[str]:
     """
     Try IP discovery strategies in the given order.
     order elements: "scan", "mdns"
     """
     for method in order:
         if method == "scan":
-            ip = find_device_ip_by_scan(
-                LAN_SUBNET_PREFIX, SCAN_START_HOST, SCAN_END_HOST
-            )
+            ip = find_device_ip_by_scan(subnet_prefix, SCAN_START_HOST, SCAN_END_HOST)
         elif method == "mdns":
             ip = find_device_ip_by_hostname(TASMOTA_HOSTNAME)
         else:
@@ -286,21 +310,23 @@ def resolve_device_ip(order: List[str]) -> Optional[str]:
     return None
 
 
-# -------- Phase 2: LAN-side update (UrlFetch + Upgrade 1) --------
+# -------- Phase 2: LAN-side script fetch + upgrade --------
 
 
-def send_phase2_commands(device_ip: str, max_retries=3) -> bool:
+def send_script_fetch(device_ip: str, max_retries=3) -> bool:
     """
-    Phase 2 (LAN): send UrlFetch + Upgrade 1 to the device IP.
-    Mirrors _sendPhase2Commands in Flutter.
+    Phase 2a (LAN): UrlFetch <BERRY_SCRIPT_URL> only.
+    Failure is fatal in this single-purpose upgrade script.
     """
-    commands = f"Backlog0 UrlFetch {BERRY_SCRIPT_URL}; Upgrade 1"
+    if not BERRY_SCRIPT_URL:
+        print("[Phase 2a] No BERRY_SCRIPT_URL set, skipping UrlFetch")
+        return True
+
     url = f"http://{device_ip}/cm"
-
-    print(f"[Phase 2] Sending UrlFetch + Upgrade 1 to {url}")
-
+    commands = f"UrlFetch {BERRY_SCRIPT_URL}"
+    print(f"[Phase 2a] Sending UrlFetch to {url}")
     for attempt in range(1, max_retries + 1):
-        print(f"  Phase 2 attempt {attempt}/{max_retries}...")
+        print(f"  UrlFetch attempt {attempt}/{max_retries}...")
         try:
             resp = requests.get(url, params={"cmnd": commands}, timeout=15)
             if resp.status_code == 200:
@@ -308,17 +334,44 @@ def send_phase2_commands(device_ip: str, max_retries=3) -> bool:
                     data = resp.json()
                 except Exception:
                     data = resp.text
-                print(f"  ✓ Phase 2 HTTP 200, response: {data}")
+                print(f"  ✓ UrlFetch HTTP 200, response: {data}")
                 return True
             else:
-                print(f"  ✗ HTTP {resp.status_code} during Phase 2")
+                print(f"  ✗ HTTP {resp.status_code} during UrlFetch")
         except Exception as e:
-            print(f"  ✗ Phase 2 request failed: {e}")
-
+            print(f"  ✗ UrlFetch request failed: {e}")
         if attempt < max_retries:
-            print("  Retrying Phase 2 in 3 seconds...")
+            print("  Retrying UrlFetch in 3 seconds...")
             time.sleep(3)
+    return False
 
+
+def send_upgrade(device_ip: str, max_retries=3) -> bool:
+    """
+    Phase 2b (LAN): Upgrade 1 only.
+    Relies on OtaUrl set during Phase 1.
+    """
+    url = f"http://{device_ip}/cm"
+    commands = "Upgrade 1"
+    print(f"[Phase 2b] Sending Upgrade 1 to {url}")
+    for attempt in range(1, max_retries + 1):
+        print(f"  Upgrade attempt {attempt}/{max_retries}...")
+        try:
+            resp = requests.get(url, params={"cmnd": commands}, timeout=15)
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = resp.text
+                print(f"  ✓ Upgrade HTTP 200, response: {data}")
+                return True
+            else:
+                print(f"  ✗ HTTP {resp.status_code} during Upgrade 1")
+        except Exception as e:
+            print(f"  ✗ Upgrade request failed: {e}")
+        if attempt < max_retries:
+            print("  Retrying Upgrade in 5 seconds...")
+            time.sleep(5)
     return False
 
 
@@ -457,86 +510,110 @@ def verify_script(ip: str) -> bool:
         return False
 
 
-# -------- Orchestration (one-device flow) --------
-
 if __name__ == "__main__":
     config = load_config()
     router_ssid = config["ssid"]
     router_password = config["password"]
 
+    print("=== MULTI-DEVICE MODE: Continuous provisioning ===\n")
     print(f"Target router SSID: {router_ssid}")
     print(f"IP discovery order: {IP_DISCOVERY_ORDER}")
-    print("Assumption: LAN (eth0) has access to the router subnet.\n")
+    print(f"Max devices to provision: {MAX_DEVICES}\n")
 
-    # STEP 1: Connect to AP
-    print("=== STEP 1: Connect WiFi to AccuSaver AP ===")
-    if not connect_wifi_to_ap():
-        print("✗ Could not connect WiFi to Tasmota AP")
-        raise SystemExit(1)
+    success_count = 0
 
-    if not ensure_ap_http():
-        print("✗ Tasmota AP HTTP not reachable, aborting")
-        raise SystemExit(1)
+    while success_count < MAX_DEVICES:
+        device_number = success_count + 1
+        print("\n==============================================")
+        print(f" Ready for device #{device_number} of {MAX_DEVICES}")
+        print(" Power on the next AccuSaver device now.")
+        print("==============================================\n")
 
-    # STEP 2: Phase 1 - WiFi + OtaUrl
-    print("\n=== STEP 2: Phase 1 - Send WiFi credentials + OtaUrl ===")
-    if not send_phase1_commands(router_ssid, router_password):
-        print("✗ Phase 1 failed")
-        raise SystemExit(1)
+        # STEP 1: Connect to AP
+        print("=== STEP 1: Connect WiFi to AccuSaver AP ===")
+        while not connect_wifi_to_ap():
+            print("✗ Could not connect to AP, retrying in 3 seconds...")
+            time.sleep(3)
 
-    # STEP 3: Wait for device to join home WiFi
-    print("\n=== STEP 3: Wait for device to join home WiFi ===")
-    print("Waiting 20 seconds before LAN discovery...")
-    time.sleep(20)
+        if not ensure_ap_http():
+            print("✗ AP unreachable, restarting whole loop...\n")
+            continue
 
-    # OPTIONAL: free wlan0 again (keeps things clean)
-    disconnect_wifi()
+        # STEP 2: Phase 1 - WiFi + OtaUrl
+        print("\n=== STEP 2: Phase 1 - Send WiFi credentials + OtaUrl ===")
+        if not send_phase1_commands(router_ssid, router_password):
+            print("✗ Phase 1 failed, restarting loop...\n")
+            continue
 
-    # STEP 4: Discover device IP using chosen strategies (LAN side)
-    print("\n=== STEP 4: Discover device IP (LAN) ===")
-    device_ip = resolve_device_ip(IP_DISCOVERY_ORDER)
-    if not device_ip:
-        print("✗ Could not find device IP on home network")
-        raise SystemExit(1)
+        # STEP 3: Wait for device to join home WiFi
+        print("\n=== STEP 3: Wait for device to join home WiFi ===")
+        print("Waiting 20 seconds before LAN discovery...")
+        time.sleep(20)
 
-    # STEP 5: Phase 2 - UrlFetch + Upgrade 1 (safeboot)
-    print("\n=== STEP 5: Phase 2 - UrlFetch + Upgrade 1 ===")
-    if not send_phase2_commands(device_ip):
-        print("✗ Phase 2 failed")
-        raise SystemExit(1)
+        # OPTIONAL: free wlan0 again (keeps things clean)
+        disconnect_wifi()
 
-    # STEP 6: Wait for safeboot to complete (ScriptVersion)
-    print("\n=== STEP 6: Wait for safeboot / ScriptVersion ===")
-    time.sleep(10)
-    if not wait_for_script_after_safeboot(device_ip, EXPECTED_SCRIPT_VERSION):
-        print("✗ Safeboot / Berry script installation failed")
-        raise SystemExit(1)
+        # STEP 4: Discover device IP using chosen strategies (LAN side)
+        print("\n=== STEP 4: Discover device IP (LAN) ===")
+        try:
+            lan_prefix = detect_lan_prefix(LAN_INTERFACE)
+        except RuntimeError as e:
+            print(f"✗ {e}, restarting loop...\n")
+            continue
 
-    # STEP 7: Reset 4 and wait online
-    print("\n=== STEP 7: Reset 4 and wait for device online ===")
-    if not send_reset4(device_ip):
-        print("✗ Reset 4 failed")
-        raise SystemExit(1)
+        device_ip = resolve_device_ip(IP_DISCOVERY_ORDER, lan_prefix)
+        if not device_ip:
+            print("✗ Could not find device IP on home network, restarting loop...\n")
+            continue
 
-    time.sleep(5)
-    if not wait_for_device_online(device_ip):
-        print("✗ Device offline after Reset 4")
-        raise SystemExit(1)
+        # STEP 5: Phase 2a - UrlFetch (script)
+        print("\n=== STEP 5: Phase 2a - UrlFetch (script fetch) ===")
+        if not send_script_fetch(device_ip):
+            print("✗ UrlFetch failed in upgrade mode, restarting loop...\n")
+            continue
 
-    # STEP 8: Verification
-    print("\n=== STEP 8: Verify firmware and script ===")
-    fw_ok = verify_firmware(device_ip)
-    script_ok = verify_script(device_ip)
-    if not (fw_ok and script_ok):
-        print("✗ Verification failed")
-        raise SystemExit(1)
+        # STEP 6: Phase 2b - Upgrade 1 (firmware OTA)
+        print("\n=== STEP 6: Phase 2b - Upgrade 1 (firmware OTA) ===")
+        if not send_upgrade(device_ip):
+            print("✗ Upgrade 1 failed, restarting loop...\n")
+            continue
 
-    print("✓ Verification complete!")
+        # STEP 7: Wait for safeboot / ScriptVersion
+        print("\n=== STEP 7: Wait for safeboot / ScriptVersion ===")
+        time.sleep(10)
+        if not wait_for_script_after_safeboot(device_ip, EXPECTED_SCRIPT_VERSION):
+            print("✗ Safeboot / Berry script installation failed, restarting loop...\n")
+            continue
 
-    # STEP 9: Reset 1 (factory reset)
-    print("\n=== STEP 9: Factory reset (Reset 1) ===")
-    send_reset1(device_ip)
+        # STEP 8: Reset 4 and wait online
+        print("\n=== STEP 8: Reset 4 and wait for device online ===")
+        if not send_reset4(device_ip):
+            print("✗ Reset 4 failed, restarting loop...\n")
+            continue
 
-    print("\n════════════════════════════════════════")
-    print(f"✓ SUCCESS: {TASMOTA_HOSTNAME} ({device_ip}) fully provisioned")
-    print("════════════════════════════════════════")
+        time.sleep(5)
+        if not wait_for_device_online(device_ip):
+            print("✗ Device offline after Reset 4, restarting loop...\n")
+            continue
+
+        # STEP 9: Verification
+        print("\n=== STEP 9: Verify firmware and script ===")
+        fw_ok = verify_firmware(device_ip)
+        script_ok = verify_script(device_ip)
+        if not (fw_ok and script_ok):
+            print("✗ Verification failed, restarting loop...\n")
+            continue
+
+        # STEP 10: Reset 1 (factory reset)
+        print("\n=== STEP 10: Factory reset (Reset 1) ===")
+        send_reset1(device_ip)
+
+        success_count += 1
+
+        print("\n==============================================================")
+        print(f"✓ SUCCESS: {device_ip} fully provisioned and factory-reset!")
+        print(f"  Provisioned devices: {success_count}/{MAX_DEVICES}")
+        print("==============================================================\n")
+
+    print("\nAll done!")
+    print(f"{success_count} device(s) successfully provisioned.")
