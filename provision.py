@@ -17,8 +17,8 @@ TASMOTA_HOSTNAME = "accusaver-3FCAD739"  # Hostname once on LAN
 EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
 EXPECTED_SCRIPT_VERSION = "1.0.0"
 
-WIFI_INTERFACE = "wlan0"          # Pi Wi-Fi interface (AP side)
-LAN_INTERFACE = "eth0"            # <-- interface used to reach your router/LAN
+WIFI_INTERFACE = "wlan0"  # Pi Wi-Fi interface (AP side)
+LAN_INTERFACE = "eth0"  # <-- interface used to reach your router/LAN
 
 SCAN_START_HOST = 1
 SCAN_END_HOST = 254
@@ -26,9 +26,10 @@ SCAN_END_HOST = 254
 # For speed you can use ["mdns", "scan"]
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-MAX_DEVICES = 4  # how many successfully provisioned devices before stopping
+MAX_DEVICES = 18  # how many successfully provisioned devices before stopping
 
 # -------- Helpers --------
+
 
 def load_config():
     """
@@ -83,6 +84,7 @@ def detect_lan_prefix(interface: str) -> str:
 
 # -------- Wi-Fi / AP handling (Pi / Linux) --------
 
+
 def disconnect_wifi():
     print(f"[WiFi] Disconnecting {WIFI_INTERFACE}...")
     run_cmd(["nmcli", "device", "disconnect", WIFI_INTERFACE])
@@ -105,8 +107,7 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
 
     # Filter SSIDs starting with "accusaver-"
     accusavers = [
-        line for line in lines
-        if line.strip().lower().startswith("accusaver")
+        line for line in lines if line.strip().lower().startswith("accusaver")
     ]
 
     print("  Available networks:")
@@ -117,10 +118,17 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
         print("  (no accusavers found)")
 
     print(f"[WiFi] Connecting {WIFI_INTERFACE} to SSID {TASMOTA_AP_SSID}...")
-    proc = run_cmd([
-        "nmcli", "device", "wifi", "connect", TASMOTA_AP_SSID,
-        "ifname", WIFI_INTERFACE,
-    ])
+    proc = run_cmd(
+        [
+            "nmcli",
+            "device",
+            "wifi",
+            "connect",
+            TASMOTA_AP_SSID,
+            "ifname",
+            WIFI_INTERFACE,
+        ]
+    )
     if proc.returncode != 0:
         print(f"  ✗ nmcli connect error: {proc.stderr.strip()}")
         return False
@@ -162,6 +170,7 @@ def ensure_ap_http(max_attempts: int = 5) -> bool:
 
 # -------- Phase 1: AP-side provisioning --------
 
+
 def send_phase1_commands(router_ssid: str, router_password: str, max_retries=3) -> bool:
     """
     Phase 1 (AP): send WiFi credentials + OtaUrl (no UrlFetch/Upgrade yet).
@@ -199,6 +208,7 @@ def send_phase1_commands(router_ssid: str, router_password: str, max_retries=3) 
 
 
 # -------- IP discovery strategies (LAN side) --------
+
 
 def find_device_ip_by_hostname(
     hostname: str,
@@ -247,19 +257,27 @@ def find_device_ip_by_scan(
     Strategy: "scan"
     Parallel scan subnet_prefix.X using Status 5 on each IP.
     """
-    print(f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)")
+    print(
+        f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)"
+    )
 
     def probe(host: int) -> Optional[str]:
         ip = f"{subnet_prefix}{host}"
         url = f"http://{ip}/cm"
         try:
-            resp = requests.get(url, params={"cmnd": "Status 5"}, timeout=timeout_seconds)
+            resp = requests.get(
+                url, params={"cmnd": "Status 5"}, timeout=timeout_seconds
+            )
             if resp.status_code == 200:
                 data = resp.json()
                 hostname = str(data.get("StatusNET", {}).get("Hostname", "")).lower()
-                ip_reported = str(data.get("StatusNET", {}).get("IPAddress", "")).strip()
+                ip_reported = str(
+                    data.get("StatusNET", {}).get("IPAddress", "")
+                ).strip()
                 if hostname.startswith("accusaver") or hostname.startswith("tasmota"):
-                    print(f"  ✓ Found candidate at {ip} (Hostname={hostname}, IP={ip_reported})")
+                    print(
+                        f"  ✓ Found candidate at {ip} (Hostname={hostname}, IP={ip_reported})"
+                    )
                     return ip_reported or ip
         except Exception:
             pass
@@ -305,6 +323,7 @@ def resolve_device_ip(order: List[str], subnet_prefix: str) -> Optional[str]:
 
 
 # -------- Phase 2: LAN-side script fetch + upgrade --------
+
 
 def send_script_fetch(device_ip: str, max_retries=3) -> bool:
     """
@@ -391,7 +410,9 @@ def wait_for_script_after_safeboot(
                 data = resp.json()
                 version = str(data.get("ScriptVersion", "")).strip()
                 if version:
-                    print(f"    ScriptVersion: {version} (expected: {expected_version})")
+                    print(
+                        f"    ScriptVersion: {version} (expected: {expected_version})"
+                    )
                     if version == expected_version:
                         print("  ✓ ScriptVersion matches, safeboot complete!")
                         return True
@@ -407,6 +428,7 @@ def wait_for_script_after_safeboot(
 
 
 # -------- Resets and online wait --------
+
 
 def send_reset4(ip: str) -> bool:
     print("[Reset 4] Sending Reset 4 (activate firmware, keep WiFi)")
@@ -430,7 +452,9 @@ def send_reset1(ip: str) -> bool:
         return False
 
 
-def wait_for_device_online(ip: str, max_attempts: int = 20, delay_seconds: int = 3) -> bool:
+def wait_for_device_online(
+    ip: str, max_attempts: int = 20, delay_seconds: int = 3
+) -> bool:
     print("[Online check] Waiting for device to come back online...")
     for attempt in range(1, max_attempts + 1):
         print(f"  Status 0 check {attempt}/{max_attempts}...")
@@ -452,6 +476,7 @@ def wait_for_device_online(ip: str, max_attempts: int = 20, delay_seconds: int =
 
 
 # -------- Verification --------
+
 
 def verify_firmware(ip: str) -> bool:
     print("[Verify] Verifying firmware...")
@@ -508,6 +533,7 @@ if __name__ == "__main__":
     print(f"Max devices to provision: {MAX_DEVICES}\n")
 
     success_count = 0
+    provision_times: List[float] = []
 
     while success_count < MAX_DEVICES:
         device_number = success_count + 1
@@ -516,91 +542,150 @@ if __name__ == "__main__":
         print(" Power on the next AccuSaver device now.")
         print("==============================================\n")
 
+        device_start = time.time()
+
         # STEP 1: Connect to AP
         print("=== STEP 1: Connect WiFi to AccuSaver AP ===")
+        step_start = time.time()
         while not connect_wifi_to_ap():
             print("✗ Could not connect to AP, retrying in 3 seconds...")
             time.sleep(3)
 
         if not ensure_ap_http():
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 1 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ AP unreachable, restarting whole loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 1 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 2: Phase 1 - WiFi + OtaUrl
-        print("\n=== STEP 2: Phase 1 - Send WiFi credentials + OtaUrl ===")
+        print("=== STEP 2: Phase 1 - Send WiFi credentials + OtaUrl ===")
+        step_start = time.time()
         if not send_phase1_commands(router_ssid, router_password):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 2 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Phase 1 failed, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 2 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 3: Wait for device to join home WiFi
-        print("\n=== STEP 3: Wait for device to join home WiFi ===")
+        print("=== STEP 3: Wait for device to join home WiFi ===")
+        step_start = time.time()
         print("Waiting 10 seconds before LAN discovery...")
         time.sleep(10)
 
         # OPTIONAL: free wlan0 again (keeps things clean)
         disconnect_wifi()
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 3 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 4: Discover device IP using chosen strategies (LAN side)
-        print("\n=== STEP 4: Discover device IP (LAN) ===")
+        print("=== STEP 4: Discover device IP (LAN) ===")
+        step_start = time.time()
         try:
             lan_prefix = detect_lan_prefix(LAN_INTERFACE)
         except RuntimeError as e:
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 4 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print(f"✗ {e}, restarting loop...\n")
             continue
 
         device_ip = resolve_device_ip(IP_DISCOVERY_ORDER, lan_prefix)
         if not device_ip:
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 4 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Could not find device IP on home network, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 4 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 5: Phase 2a - UrlFetch (script)
-        print("\n=== STEP 5: Phase 2a - UrlFetch (script fetch) ===")
+        print("=== STEP 5: Phase 2a - UrlFetch (script fetch) ===")
+        step_start = time.time()
         if not send_script_fetch(device_ip):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 5 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ UrlFetch failed in upgrade mode, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 5 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 6: Phase 2b - Upgrade 1 (firmware OTA)
-        print("\n=== STEP 6: Phase 2b - Upgrade 1 (firmware OTA) ===")
+        print("=== STEP 6: Phase 2b - Upgrade 1 (firmware OTA) ===")
+        step_start = time.time()
         if not send_upgrade(device_ip):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 6 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Upgrade 1 failed, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 6 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 7: Wait for safeboot / ScriptVersion
-        print("\n=== STEP 7: Wait for safeboot / ScriptVersion ===")
+        print("=== STEP 7: Wait for safeboot / ScriptVersion ===")
+        step_start = time.time()
         time.sleep(10)
         if not wait_for_script_after_safeboot(device_ip, EXPECTED_SCRIPT_VERSION):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 7 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Safeboot / Berry script installation failed, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 7 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 8: Reset 4 and wait online
-        print("\n=== STEP 8: Reset 4 and wait for device online ===")
+        print("=== STEP 8: Reset 4 and wait for device online ===")
+        step_start = time.time()
         if not send_reset4(device_ip):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 8 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Reset 4 failed, restarting loop...\n")
             continue
 
         time.sleep(5)
         if not wait_for_device_online(device_ip):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 8 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Device offline after Reset 4, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 8 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 9: Verification
-        print("\n=== STEP 9: Verify firmware and script ===")
+        print("=== STEP 9: Verify firmware and script ===")
+        step_start = time.time()
         fw_ok = verify_firmware(device_ip)
         script_ok = verify_script(device_ip)
         if not (fw_ok and script_ok):
+            step_elapsed = time.time() - step_start
+            print(f"--- STEP 9 duration: {step_elapsed:.1f} seconds (failed) ---\n")
             print("✗ Verification failed, restarting loop...\n")
             continue
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 9 duration: {step_elapsed:.1f} seconds ---\n")
 
         # STEP 10: Reset 1 (factory reset)
-        print("\n=== STEP 10: Factory reset (Reset 1) ===")
+        print("=== STEP 10: Factory reset (Reset 1) ===")
+        step_start = time.time()
         send_reset1(device_ip)
+        step_elapsed = time.time() - step_start
+        print(f"--- STEP 10 duration: {step_elapsed:.1f} seconds ---\n")
 
         success_count += 1
+        device_elapsed = time.time() - device_start
+        provision_times.append(device_elapsed)
 
         print("\n==============================================================")
         print(f"✓ SUCCESS: {device_ip} fully provisioned and factory-reset!")
         print(f"  Provisioned devices: {success_count}/{MAX_DEVICES}")
+        print(f"  Device #{device_number} total time: {device_elapsed:.1f} seconds")
         print("==============================================================\n")
 
     print("\nAll done!")
     print(f"{success_count} device(s) successfully provisioned.")
+
+    if provision_times:
+        avg_time = sum(provision_times) / len(provision_times)
+        print(f"Average provision time per device: {avg_time:.1f} seconds")
