@@ -330,52 +330,58 @@ def find_all_devices_by_scan(
     subnet_prefix: str,
     start_host: int = 1,
     end_host: int = 254,
-    timeout_seconds: float = 0.3,
+    timeout_seconds: float = 1.0,  # was 0.3
     max_workers: int = 32,
 ) -> Dict[str, str]:
+    """
+    Scans subnet for AccuSaver/Tasmota devices using HTTP Status 5
+    with retries matching scan.py behaviour.
+    Returns IP->hostname mapping.
+    """
     print(
         f"[IP discovery: scan] Scanning {subnet_prefix}{start_host}-{end_host} via Status 5 (parallel)"
     )
 
     found: Dict[str, str] = {}
 
-    def probe(host: int) -> Optional[Tuple[str, str]]:
-        ip = f"{subnet_prefix}{host}"
+    def probe_ip(ip: str) -> Optional[Tuple[str, str]]:
         url = f"http://{ip}/cm"
-        try:
-            resp = requests.get(
-                url, params={"cmnd": "Status 5"}, timeout=timeout_seconds
-            )
-            if resp.status_code == 200:
+
+        # mimic scan.py retry behaviour
+        for attempt in range(1, 3):
+            try:
+                resp = requests.get(
+                    url, params={"cmnd": "Status 5"}, timeout=timeout_seconds
+                )
+                if resp.status_code != 200:
+                    continue
+
                 data = resp.json()
-                hostname = str(data.get("StatusNET", {}).get("Hostname", "")).lower()
-                ip_reported = str(
-                    data.get("StatusNET", {}).get("IPAddress", "")
-                ).strip()
+                statusnet = data.get("StatusNET", {})
+
+                hostname = (statusnet.get("Hostname", "") or "").lower()
+                ip_reported = statusnet.get("IPAddress", "") or ip
+
                 if hostname.startswith("accusaver") or hostname.startswith("tasmota"):
-                    real_ip = ip_reported or ip
-                    return (real_ip, hostname)
-        except Exception:
-            pass
+                    return (ip_reported, hostname)
+
+            except Exception:
+                if attempt == 2:
+                    return None
+                time.sleep(0.05)
         return None
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(probe, host): host
-            for host in range(start_host, end_host + 1)
+            executor.submit(probe_ip, f"{subnet_prefix}{h}"): h
+            for h in range(start_host, end_host + 1)
         }
+
         for future in as_completed(futures):
             result = future.result()
             if result:
-                ip, hostname = result
-                found[ip] = hostname
-
-    if found:
-        print(f"[scan] Found {len(found)} AccuSaver/Tasmota device(s) on LAN")
-        for ip, hostname in found.items():
-            print(f"  - {ip} ({hostname})")
-    else:
-        print("  ✗ scan-based IP discovery found no devices")
+                reported_ip, hostname = result
+                found[reported_ip] = hostname
 
     return found
 
@@ -683,17 +689,23 @@ if __name__ == "__main__":
         print(f"  {ap['ssid']}  {ap['bssid']}  CH:{ap['chan']}  SIG:{ap['signal']}")
 
     if detected_count != EXPECTED_DEVICES:
-        print(f"\n✗ AP count mismatch! Expected {EXPECTED_DEVICES}, found {detected_count}")
+        print(
+            f"\n✗ AP count mismatch! Expected {EXPECTED_DEVICES}, found {detected_count}"
+        )
         if detected_count < EXPECTED_DEVICES:
             missing = EXPECTED_DEVICES - detected_count
             print(f"  → Power on {missing} more device(s) and re-run the script")
         else:
             extra = detected_count - EXPECTED_DEVICES
-            print(f"  → {extra} extra device(s) in range. Update EXPECTED_DEVICES or remove extras.")
+            print(
+                f"  → {extra} extra device(s) in range. Update EXPECTED_DEVICES or remove extras."
+            )
         print("\nAborting.")
         exit(1)
 
-    print(f"\n✓ Pre-flight check passed: {detected_count} APs detected, {EXPECTED_DEVICES} expected\n")
+    print(
+        f"\n✓ Pre-flight check passed: {detected_count} APs detected, {EXPECTED_DEVICES} expected\n"
+    )
 
     # ---------- PHASE A: AP provisioning for N devices ----------
 
