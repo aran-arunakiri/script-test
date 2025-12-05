@@ -26,7 +26,7 @@ SCAN_END_HOST = 254
 # For speed you can use ["mdns", "scan"]
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-MAX_DEVICES = 18  # how many successfully provisioned devices before stopping
+MAX_DEVICES = 1
 
 # -------- Helpers --------
 
@@ -114,6 +114,8 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
     if accusavers:
         for line in accusavers:
             print(" ", line)
+
+        print(f"  → {len(accusavers)} AccuSaver AP(s) detected.")
     else:
         print("  (no accusavers found)")
 
@@ -522,6 +524,14 @@ def verify_script(ip: str) -> bool:
         return False
 
 
+def scan_accusaver_aps() -> int:
+    run_cmd(["nmcli", "device", "wifi", "rescan"])
+    time.sleep(2)
+    scan_list = run_cmd(["nmcli", "-f", "SSID", "device", "wifi"])
+    lines = scan_list.stdout.splitlines()
+    return sum(1 for l in lines if l.strip().lower().startswith("accusaver"))
+
+
 if __name__ == "__main__":
     config = load_config()
     router_ssid = config["ssid"]
@@ -547,6 +557,16 @@ if __name__ == "__main__":
         device_start = time.time()
 
         # STEP 1: Connect to AP
+        if total_attempts == 1:
+            print("=== Initial sanity scan for AccuSaver APs ===")
+            found = scan_accusaver_aps()
+            print(f"  Found {found} AccuSaver AP(s). Expected: {MAX_DEVICES}")
+            if found != MAX_DEVICES:
+                raise RuntimeError(
+                    f"✗ AP count mismatch: detected {found} device(s), "
+                    f"but MAX_DEVICES={MAX_DEVICES}. Check network / power cycle units."
+                )
+
         print("=== STEP 1: Connect WiFi to AccuSaver AP ===")
         step_start = time.time()
         while not connect_wifi_to_ap():

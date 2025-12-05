@@ -1,10 +1,37 @@
 import json
 import subprocess
 import time
+import threading
 from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.exceptions import ReadTimeout, ConnectionError, Timeout
+
+
+# -------- Progress tracking --------
+progress_lock = threading.Lock()
+device_status: Dict[str, str] = {}  # ip -> status string
+
+
+def update_status(ip: str, status: str):
+    """Update device status and print progress summary."""
+    with progress_lock:
+        device_status[ip] = status
+        print_progress()
+
+
+def print_progress():
+    """Print a one-line progress summary."""
+    complete = sum(1 for s in device_status.values() if s == "✓ Complete")
+    failed = sum(1 for s in device_status.values() if s.startswith("✗"))
+    in_progress = len(device_status) - complete - failed
+
+    status_line = f"[PROGRESS] ✓ {complete} complete | ⋯ {in_progress} in progress | ✗ {failed} failed"
+    print(f"\n{status_line}")
+
+    # Show what each device is doing
+    for ip, status in sorted(device_status.items()):
+        print(f"  {ip}: {status}")
 
 
 # -------- Configurable constants --------
@@ -26,7 +53,7 @@ SCAN_END_HOST = 254
 
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-MAX_DEVICES = 1
+EXPECTED_DEVICES = 8
 
 # Stagger delay between each device starting LAN provisioning (seconds)
 STAGGER_DELAY = 15.0
@@ -78,29 +105,141 @@ def disconnect_wifi():
     run_cmd(["nmcli", "device", "disconnect", WIFI_INTERFACE])
 
 
-def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
-    disconnect_wifi()  # Drop WiFi connection
-    run_cmd(["ip", "addr", "flush", "dev", WIFI_INTERFACE])  # Clear any lingering IP
+def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
+    """Parse nmcli wifi scan output into list of dicts with SSID, BSSID, CHAN, SIGNAL."""
+    results = []
+    lines = scan_output.strip().splitlines()
+    if not lines:
+        return results
 
-    print(f"[WiFi] Scanning for {TASMOTA_AP_SSID}...")
-    run_cmd(["nmcli", "device", "wifi", "rescan"])
-    time.sleep(2)
+    # Skip header line
+    for line in lines[1:]:
+        # Format: "SSID                BSSID              CHAN  SIGNAL"
+        # Fields are separated by whitespace, but SSID might have spaces
+        parts = line.split()
+        if len(parts) >= 4:
+            # Last 3 parts are BSSID, CHAN, SIGNAL
+            # Everything before is SSID
+            signal = parts[-1]
+            chan = parts[-2]
+            bssid = parts[-3]
+            ssid = " ".join(parts[:-3])
 
-    scan_list = run_cmd(["nmcli", "-f", "SSID,CHAN,SIGNAL", "device", "wifi"])
-    lines = scan_list.stdout.splitlines()
+            if ssid.lower().startswith("accusaver"):
+                results.append(
+                    {
+                        "ssid": ssid,
+                        "bssid": bssid,
+                        "chan": chan,
+                        "signal": signal,
+                    }
+                )
 
-    accusavers = [
-        line for line in lines if line.strip().lower().startswith("accusaver")
-    ]
+    return results
 
-    print("  Available networks:")
-    if accusavers:
-        for line in accusavers:
-            print(" ", line)
+
+def scan_accusaver_aps() -> List[Dict[str, str]]:
+    """
+    Scan for AccuSaver APs and return list of unique APs (by BSSID).
+    Used for initial sanity check before Phase A.
+    """
+    print(f"[WiFi] Scanning for AccuSaver APs (fresh scan)...")
+
+    scan_result = run_cmd(
+        [
+            "nmcli",
+            "-f",
+            "SSID,BSSID,CHAN,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            WIFI_INTERFACE,
+            "--rescan",
+            "yes",
+        ]
+    )
+
+    all_aps = parse_wifi_scan(scan_result.stdout)
+
+    # Deduplicate by BSSID (same AP can appear multiple times in scan)
+    seen_bssids = set()
+    unique_aps = []
+    for ap in all_aps:
+        if ap["bssid"] not in seen_bssids:
+            seen_bssids.add(ap["bssid"])
+            unique_aps.append(ap)
+
+    # Sort by signal strength (strongest first)
+    unique_aps.sort(key=lambda x: int(x["signal"]), reverse=True)
+
+    print(f"  Found {len(unique_aps)} unique AccuSaver AP(s):")
+    for ap in unique_aps:
+        print(f"    {ap['bssid']}  CH:{ap['chan']}  SIG:{ap['signal']}")
+
+    return unique_aps
+
+
+def connect_wifi_to_ap(
+    exclude_bssids: List[str] = None, max_wait_seconds: int = 20
+) -> Optional[str]:
+    """
+    Connect to an AccuSaver AP, excluding any BSSIDs in the exclude list.
+    Returns the BSSID we connected to, or None on failure.
+    """
+    if exclude_bssids is None:
+        exclude_bssids = []
+
+    disconnect_wifi()
+    run_cmd(["ip", "addr", "flush", "dev", WIFI_INTERFACE])
+
+    print(f"[WiFi] Scanning for {TASMOTA_AP_SSID} (fresh scan)...")
+
+    # Use --rescan yes for fresh results
+    scan_result = run_cmd(
+        [
+            "nmcli",
+            "-f",
+            "SSID,BSSID,CHAN,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            WIFI_INTERFACE,
+            "--rescan",
+            "yes",
+        ]
+    )
+
+    # Parse scan results
+    available_aps = parse_wifi_scan(scan_result.stdout)
+
+    print("  Available AccuSaver networks:")
+    if available_aps:
+        for ap in available_aps:
+            excluded = "(EXCLUDED)" if ap["bssid"] in exclude_bssids else ""
+            print(
+                f"    {ap['ssid']}  {ap['bssid']}  CH:{ap['chan']}  SIG:{ap['signal']}  {excluded}"
+            )
     else:
-        print("  (no accusavers found)")
+        print("    (no accusavers found)")
+        return None
 
-    print(f"[WiFi] Connecting {WIFI_INTERFACE} to SSID {TASMOTA_AP_SSID}...")
+    # Filter out already-provisioned BSSIDs
+    candidate_aps = [ap for ap in available_aps if ap["bssid"] not in exclude_bssids]
+
+    if not candidate_aps:
+        print("  ✗ All visible AccuSaver APs have already been provisioned")
+        return None
+
+    # Pick the strongest signal from candidates
+    target_ap = max(candidate_aps, key=lambda x: int(x["signal"]))
+    target_bssid = target_ap["bssid"]
+
+    print(
+        f"[WiFi] Connecting to BSSID {target_bssid} (signal: {target_ap['signal']})..."
+    )
+
     proc = run_cmd(
         [
             "nmcli",
@@ -108,13 +247,16 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
             "wifi",
             "connect",
             TASMOTA_AP_SSID,
+            "bssid",
+            target_bssid,
             "ifname",
             WIFI_INTERFACE,
         ]
     )
+
     if proc.returncode != 0:
         print(f"  ✗ nmcli connect error: {proc.stderr.strip()}")
-        return False
+        return None
 
     print(f"[WiFi] Waiting for 192.168.4.x on {WIFI_INTERFACE}...")
     for i in range(max_wait_seconds):
@@ -122,11 +264,11 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
         ip = get_current_ip(WIFI_INTERFACE)
         print(f"  AP IP check {i + 1}/{max_wait_seconds}: {ip}")
         if ip and ip.startswith("192.168.4."):
-            print(f"  ✓ On AP subnet: {ip}")
-            return True
+            print(f"  ✓ On AP subnet: {ip} (BSSID: {target_bssid})")
+            return target_bssid
 
     print("  ✗ Failed to get 192.168.4.x on Wi-Fi")
-    return False
+    return None
 
 
 def ensure_ap_http(max_attempts: int = 5) -> bool:
@@ -272,17 +414,16 @@ def find_all_devices_by_scan(
 # -------- Phase 2a: Script fetch (wait for "Done") --------
 
 
-def send_script_fetch(device_ip: str, max_retries: int = 3) -> bool:
+def send_script_fetch(
+    device_ip: str, max_retries: int = 3, verbose: bool = True
+) -> bool:
     if not BERRY_SCRIPT_URL:
-        print(f"[Phase 2a] ({device_ip}) No BERRY_SCRIPT_URL set, skipping")
         return True
 
     url = f"http://{device_ip}/cm"
     commands = f"UrlFetch {BERRY_SCRIPT_URL}"
-    print(f"[Phase 2a] ({device_ip}) Sending UrlFetch")
 
     for attempt in range(1, max_retries + 1):
-        print(f"  ({device_ip}) UrlFetch attempt {attempt}/{max_retries}...")
         try:
             resp = requests.get(url, params={"cmnd": commands}, timeout=30)
 
@@ -293,28 +434,18 @@ def send_script_fetch(device_ip: str, max_retries: int = 3) -> bool:
                     data = {}
 
                 url_fetch_result = str(data.get("UrlFetch", "")).strip()
-                print(f"  ({device_ip}) UrlFetch response: {data}")
 
                 if url_fetch_result == "Done":
-                    print(f"  ✓ ({device_ip}) UrlFetch completed!")
                     return True
-                else:
-                    print(
-                        f"  ⚠ ({device_ip}) UrlFetch result: '{url_fetch_result}' (expected 'Done')"
-                    )
-            else:
-                print(f"  ⚠ ({device_ip}) UrlFetch HTTP {resp.status_code}")
 
         except requests.Timeout:
-            print(f"  ⚠ ({device_ip}) UrlFetch timeout (download taking too long?)")
-        except Exception as e:
-            print(f"  ⚠ ({device_ip}) UrlFetch error: {e}")
+            pass
+        except Exception:
+            pass
 
         if attempt < max_retries:
-            print(f"  ({device_ip}) Retrying in 3 seconds...")
             time.sleep(3)
 
-    print(f"  ✗ ({device_ip}) UrlFetch failed after {max_retries} attempts")
     return False
 
 
@@ -324,24 +455,15 @@ def send_script_fetch(device_ip: str, max_retries: int = 3) -> bool:
 def send_upgrade(device_ip: str, max_retries=3) -> bool:
     url = f"http://{device_ip}/cm"
     commands = "Upgrade 1"
-    print(f"[Phase 2b] ({device_ip}) Sending Upgrade 1")
+
     for attempt in range(1, max_retries + 1):
-        print(f"  ({device_ip}) Upgrade attempt {attempt}/{max_retries}...")
         try:
             resp = requests.get(url, params={"cmnd": commands}, timeout=15)
             if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception:
-                    data = resp.text
-                print(f"  ✓ ({device_ip}) Upgrade HTTP 200, response: {data}")
                 return True
-            else:
-                print(f"  ✗ ({device_ip}) HTTP {resp.status_code} during Upgrade 1")
-        except Exception as e:
-            print(f"  ✗ ({device_ip}) Upgrade request failed: {e}")
+        except Exception:
+            pass
         if attempt < max_retries:
-            print(f"  ({device_ip}) Retrying Upgrade in 5 seconds...")
             time.sleep(5)
     return False
 
@@ -352,10 +474,8 @@ def wait_for_script_after_safeboot(
     max_attempts: int = 30,
     delay_seconds: int = 5,
 ) -> bool:
-    print(f"[Safeboot] ({ip}) Waiting for safeboot to complete...")
-
+    """Wait for device to come back after safeboot with correct script version."""
     for attempt in range(1, max_attempts + 1):
-        print(f"  ({ip}) ScriptVersion check {attempt}/{max_attempts}...")
         try:
             resp = requests.get(
                 f"http://{ip}/cm",
@@ -365,21 +485,12 @@ def wait_for_script_after_safeboot(
             if resp.status_code == 200:
                 data = resp.json()
                 version = str(data.get("ScriptVersion", "")).strip()
-                if version:
-                    print(
-                        f"    ({ip}) ScriptVersion: {version} (expected: {expected_version})"
-                    )
-                    if version == expected_version:
-                        print(f"  ✓ ({ip}) ScriptVersion matches, safeboot complete!")
-                        return True
-            else:
-                print(f"    ({ip}) HTTP {resp.status_code} from ScriptVersion")
-        except Exception as e:
-            print(f"    ({ip}) ScriptVersion request error: {e}")
-
+                if version == expected_version:
+                    return True
+        except Exception:
+            pass
         time.sleep(delay_seconds)
 
-    print(f"  ✗ ({ip}) Timeout waiting for ScriptVersion")
     return False
 
 
@@ -387,33 +498,25 @@ def wait_for_script_after_safeboot(
 
 
 def send_reset4(ip: str) -> bool:
-    print(f"[Reset 4] ({ip}) Sending Reset 4 (activate firmware, keep WiFi)")
     try:
         requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 4"}, timeout=5)
-        print(f"  ✓ ({ip}) Reset 4 sent")
         return True
-    except Exception as e:
-        print(f"  ✗ ({ip}) Failed to send Reset 4: {e}")
+    except Exception:
         return False
 
 
 def send_reset1(ip: str) -> bool:
-    print(f"[Reset 1] ({ip}) Sending Reset 1 (factory reset)")
     try:
         requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 1"}, timeout=5)
-        print(f"  ✓ ({ip}) Reset 1 sent")
         return True
-    except Exception as e:
-        print(f"  ✗ ({ip}) Failed to send Reset 1: {e}")
+    except Exception:
         return False
 
 
 def wait_for_device_online(
     ip: str, max_attempts: int = 20, delay_seconds: int = 3
 ) -> bool:
-    print(f"[Online check] ({ip}) Waiting for device to come back online...")
     for attempt in range(1, max_attempts + 1):
-        print(f"  ({ip}) Status 0 check {attempt}/{max_attempts}...")
         try:
             resp = requests.get(
                 f"http://{ip}/cm",
@@ -421,13 +524,10 @@ def wait_for_device_online(
                 timeout=5,
             )
             if resp.status_code == 200:
-                print(f"  ✓ ({ip}) Device is back online")
                 return True
         except Exception:
             pass
         time.sleep(delay_seconds)
-
-    print(f"  ✗ ({ip}) Timeout waiting for device")
     return False
 
 
@@ -435,7 +535,6 @@ def wait_for_device_online(
 
 
 def verify_firmware(ip: str) -> bool:
-    print(f"[Verify] ({ip}) Verifying firmware...")
     try:
         resp = requests.get(
             f"http://{ip}/cm",
@@ -443,21 +542,16 @@ def verify_firmware(ip: str) -> bool:
             timeout=10,
         )
         if resp.status_code != 200:
-            print(f"  ✗ ({ip}) Status 2 HTTP {resp.status_code}")
             return False
 
         data = resp.json()
         build_date = str(data.get("StatusFWR", {}).get("BuildDateTime", "")).strip()
-        ok = build_date == EXPECTED_FIRMWARE_DATE
-        print(f"  ({ip}) Firmware BuildDateTime: {build_date} {'✓' if ok else '✗'}")
-        return ok
-    except Exception as e:
-        print(f"  ✗ ({ip}) Firmware verification failed: {e}")
+        return build_date == EXPECTED_FIRMWARE_DATE
+    except Exception:
         return False
 
 
 def verify_script(ip: str) -> bool:
-    print(f"[Verify] ({ip}) Verifying Berry script...")
     try:
         resp = requests.get(
             f"http://{ip}/cm",
@@ -465,16 +559,12 @@ def verify_script(ip: str) -> bool:
             timeout=10,
         )
         if resp.status_code != 200:
-            print(f"  ✗ ({ip}) ScriptVersion HTTP {resp.status_code}")
             return False
 
         data = resp.json()
         version = str(data.get("ScriptVersion", "")).strip()
-        ok = version == EXPECTED_SCRIPT_VERSION
-        print(f"  ({ip}) Script version: {version} {'✓' if ok else '✗'}")
-        return ok
-    except Exception as e:
-        print(f"  ✗ ({ip}) Script verification failed: {e}")
+        return version == EXPECTED_SCRIPT_VERSION
+    except Exception:
         return False
 
 
@@ -489,59 +579,55 @@ def provision_device_on_lan(
     Returns (ip, success, elapsed_seconds).
     """
     start = time.time()
-    success = False
 
     # Stagger start to avoid network congestion during firmware download
     if stagger_delay > 0:
-        print(f"[LAN worker] ({ip}) Waiting {stagger_delay:.1f}s before starting...")
+        update_status(ip, f"⏳ Waiting {stagger_delay:.0f}s...")
         time.sleep(stagger_delay)
 
-    try:
-        print(f"\n[LAN worker] ({ip}) Starting LAN provisioning...")
+    # STEP B1: UrlFetch script
+    update_status(ip, "📥 Fetching script...")
+    if not send_script_fetch(ip):
+        update_status(ip, "✗ Script fetch failed")
+        return ip, False, time.time() - start
 
-        # STEP B1: UrlFetch script (waits for "Done" response)
-        if not send_script_fetch(ip):
-            print(f"[LAN worker] ({ip}) Script fetch failed, aborting")
-            return ip, False, time.time() - start
+    # STEP B2: Upgrade 1 (firmware OTA)
+    update_status(ip, "📦 Sending upgrade...")
+    if not send_upgrade(ip):
+        update_status(ip, "✗ Upgrade failed")
+        return ip, False, time.time() - start
 
-        # STEP B2: Upgrade 1 (firmware OTA) - safe since UrlFetch returned "Done"
-        if not send_upgrade(ip):
-            print(f"[LAN worker] ({ip}) Upgrade failed, aborting")
-            return ip, False, time.time() - start
+    # STEP B3: Wait for safeboot / ScriptVersion
+    update_status(ip, "🔄 Safeboot (firmware download)...")
+    time.sleep(10)
+    if not wait_for_script_after_safeboot(ip, EXPECTED_SCRIPT_VERSION):
+        update_status(ip, "✗ Safeboot timeout")
+        return ip, False, time.time() - start
 
-        # STEP B3: Wait for safeboot / ScriptVersion
-        time.sleep(10)
-        if not wait_for_script_after_safeboot(ip, EXPECTED_SCRIPT_VERSION):
-            print(f"[LAN worker] ({ip}) Safeboot / script install failed")
-            return ip, False, time.time() - start
+    # STEP B4: Reset 4 and wait online
+    update_status(ip, "🔁 Rebooting...")
+    if not send_reset4(ip):
+        update_status(ip, "✗ Reset failed")
+        return ip, False, time.time() - start
 
-        # STEP B4: Reset 4 and wait online
-        if not send_reset4(ip):
-            print(f"[LAN worker] ({ip}) Reset 4 failed")
-            return ip, False, time.time() - start
+    time.sleep(5)
+    if not wait_for_device_online(ip):
+        update_status(ip, "✗ Device offline after reboot")
+        return ip, False, time.time() - start
 
-        time.sleep(5)
-        if not wait_for_device_online(ip):
-            print(f"[LAN worker] ({ip}) Device did not come back after Reset 4")
-            return ip, False, time.time() - start
+    # STEP B5: Verification
+    update_status(ip, "🔍 Verifying...")
+    fw_ok = verify_firmware(ip)
+    script_ok = verify_script(ip)
+    if not (fw_ok and script_ok):
+        update_status(ip, "✗ Verification failed")
+        return ip, False, time.time() - start
 
-        # STEP B5: Verification
-        fw_ok = verify_firmware(ip)
-        script_ok = verify_script(ip)
-        if not (fw_ok and script_ok):
-            print(f"[LAN worker] ({ip}) Verification failed")
-            return ip, False, time.time() - start
-
-        # STEP B6: Factory reset
-        send_reset1(ip)
-        success = True
-        return ip, True, time.time() - start
-
-    finally:
-        elapsed = time.time() - start
-        print(
-            f"[LAN worker] ({ip}) Finished with success={success}, elapsed={elapsed:.1f}s"
-        )
+    # STEP B6: Factory reset
+    send_reset1(ip)
+    elapsed = time.time() - start
+    update_status(ip, f"✓ Complete ({elapsed:.0f}s)")
+    return ip, True, elapsed
 
 
 # -------- Main --------
@@ -556,29 +642,55 @@ if __name__ == "__main__":
     print("=== MULTI-DEVICE MODE (HORIZONTAL) ===\n")
     print(f"Target router SSID: {router_ssid}")
     print(f"IP discovery order: {IP_DISCOVERY_ORDER}")
-    print(f"Batch size: {MAX_DEVICES}")
+    print(f"Expected devices: {EXPECTED_DEVICES}")
     print(f"Stagger delay: {STAGGER_DELAY}s\n")
+
+    # ---------- SANITY CHECK: Verify expected number of APs ----------
+
+    print("=== PRE-FLIGHT CHECK: Scanning for AccuSaver APs ===\n")
+    detected_aps = scan_accusaver_aps()
+    detected_count = len(detected_aps)
+
+    if detected_count != EXPECTED_DEVICES:
+        print(f"\n✗ AP count mismatch!")
+        print(f"  Detected: {detected_count} device(s)")
+        print(f"  Expected: {EXPECTED_DEVICES} device(s)")
+        if detected_count < EXPECTED_DEVICES:
+            print(
+                f"  → Power on {EXPECTED_DEVICES - detected_count} more device(s), or reduce EXPECTED_DEVICES"
+            )
+        else:
+            print(
+                f"  → {detected_count - EXPECTED_DEVICES} extra device(s) in range. Remove them or increase EXPECTED_DEVICES"
+            )
+        exit(1)
+
+    print(f"\n✓ Pre-flight check passed: {detected_count} AccuSaver AP(s) detected\n")
 
     # ---------- PHASE A: AP provisioning for N devices ----------
 
     ap_start = time.time()
     ap_provisioned = 0
     ap_durations: List[float] = []
+    provisioned_bssids: List[str] = []  # Track BSSIDs we've already provisioned
 
-    while ap_provisioned < MAX_DEVICES:
+    while ap_provisioned < EXPECTED_DEVICES:
         device_number = ap_provisioned + 1
         print("\n==============================================")
-        print(f" PHASE A: Ready for device #{device_number} of {MAX_DEVICES}")
+        print(f" PHASE A: Ready for device #{device_number} of {EXPECTED_DEVICES}")
         print(" Power on the next AccuSaver device now.")
         print("==============================================\n")
 
         device_ap_start = time.time()
 
-        # Connect to AP
+        # Connect to AP (excluding already-provisioned BSSIDs)
         print("=== AP STEP: Connect WiFi to AccuSaver AP ===")
-        while not connect_wifi_to_ap():
-            print("✗ Could not connect to AP, retrying in 3 seconds...")
-            time.sleep(3)
+        connected_bssid = None
+        while connected_bssid is None:
+            connected_bssid = connect_wifi_to_ap(exclude_bssids=provisioned_bssids)
+            if connected_bssid is None:
+                print("✗ Could not connect to AP, retrying in 3 seconds...")
+                time.sleep(3)
 
         if not ensure_ap_http():
             print("✗ AP unreachable, skipping this device...\n")
@@ -589,6 +701,9 @@ if __name__ == "__main__":
         if not send_phase1_commands(router_ssid, router_password):
             print("✗ Phase 1 failed, skipping this device...\n")
             continue
+
+        # Track this BSSID as provisioned
+        provisioned_bssids.append(connected_bssid)
 
         # Small grace period so the device can process, then disconnect
         print("\n=== AP STEP: Disconnect and move to next device ===")
@@ -601,10 +716,12 @@ if __name__ == "__main__":
 
         print("\n==============================================================")
         print(f"✓ PHASE A SUCCESS: Device #{device_number} AP-provisioned")
+        print(f"  BSSID: {connected_bssid}")
         print(
             f"  AP provisioning time for this device: {device_ap_elapsed:.1f} seconds"
         )
-        print(f"  AP-provisioned devices: {ap_provisioned}/{MAX_DEVICES}")
+        print(f"  AP-provisioned devices: {ap_provisioned}/{EXPECTED_DEVICES}")
+        print(f"  Provisioned BSSIDs: {provisioned_bssids}")
         print("==============================================================\n")
 
     total_ap_time = time.time() - ap_start
@@ -612,7 +729,11 @@ if __name__ == "__main__":
     print(f"Total AP provisioning time: {total_ap_time:.1f} seconds")
     if ap_durations:
         avg_ap = sum(ap_durations) / len(ap_durations)
-        print(f"Average AP time per device: {avg_ap:.1f} seconds\n")
+        print(f"Average AP time per device: {avg_ap:.1f} seconds")
+    print(f"Provisioned BSSIDs ({len(provisioned_bssids)}):")
+    for bssid in provisioned_bssids:
+        print(f"  - {bssid}")
+    print()
 
     # ---------- PHASE B: LAN batch upgrade & verify ----------
 
@@ -624,7 +745,7 @@ if __name__ == "__main__":
         print(f"✗ {e}, cannot proceed with PHASE B.")
         exit(1)
 
-    # Discover up to MAX_DEVICES devices whose hostname starts with 'accusaver'
+    # Discover up to EXPECTED_DEVICES devices whose hostname starts with 'accusaver'
     lan_discovery_start = time.time()
     devices_found: Dict[str, str] = {}
     max_discovery_rounds = 12
@@ -639,12 +760,12 @@ if __name__ == "__main__":
                 devices_found[ip] = hostname
 
         print(
-            f"[LAN discovery] AccuSaver devices found so far: {len(devices_found)}/{MAX_DEVICES}"
+            f"[LAN discovery] AccuSaver devices found so far: {len(devices_found)}/{EXPECTED_DEVICES}"
         )
         for ip, hostname in devices_found.items():
             print(f"  - {ip} ({hostname})")
 
-        if len(devices_found) >= MAX_DEVICES:
+        if len(devices_found) >= EXPECTED_DEVICES:
             print("[LAN discovery] Found required number of devices on LAN.")
             break
 
@@ -656,9 +777,9 @@ if __name__ == "__main__":
         print("✗ No AccuSaver devices found on LAN. Cannot continue.")
         exit(1)
 
-    if len(devices_found) < MAX_DEVICES:
+    if len(devices_found) < EXPECTED_DEVICES:
         print(
-            f"✗ ERROR: Only {len(devices_found)}/{MAX_DEVICES} AccuSaver device(s) discovered on LAN."
+            f"✗ ERROR: Only {len(devices_found)}/{EXPECTED_DEVICES} AccuSaver device(s) discovered on LAN."
         )
         print("  Aborting. Make sure all devices are powered on and connected to WiFi.")
         exit(1)
@@ -672,6 +793,14 @@ if __name__ == "__main__":
 
     lan_batch_start = time.time()
     lan_results: List[Tuple[str, bool, float]] = []
+
+    # Initialize progress tracking
+    device_status.clear()
+    for ip in devices_found.keys():
+        device_status[ip] = "⏳ Queued"
+
+    print("\n=== PHASE B: Starting parallel upgrades ===")
+    print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
     with ThreadPoolExecutor(max_workers=min(len(devices_found), 8)) as executor:
@@ -687,41 +816,38 @@ if __name__ == "__main__":
                 ip_result, success, elapsed = future.result()
                 lan_results.append((ip_result, success, elapsed))
             except Exception as e:
-                print(f"[LAN worker] ({ip}) raised unexpected exception: {e}")
+                update_status(ip, f"✗ Exception: {e}")
                 lan_results.append((ip, False, 0.0))
 
     lan_batch_elapsed = time.time() - lan_batch_start
 
-    # ---------- Stats & summary ----------
+    # ---------- Final Summary ----------
 
     total_success = sum(1 for _, ok, _ in lan_results if ok)
     total_fail = len(lan_results) - total_success
 
-    print("\n=== BATCH SUMMARY ===")
-    print(f"Batch size (expected): {MAX_DEVICES}")
-    print(f"Devices discovered on LAN: {len(devices_found)}")
-    print(f"LAN workers executed: {len(lan_results)}")
-    print(f"  ✓ Success: {total_success}")
-    print(f"  ✗ Failed: {total_fail}\n")
+    print("\n" + "=" * 60)
+    print("=== FINAL RESULTS ===")
+    print("=" * 60)
 
-    for ip, success, elapsed in lan_results:
-        print(f"  Device {ip}: success={success}, LAN phase time={elapsed:.1f} seconds")
+    # Show final status of each device
+    for ip, success, elapsed in sorted(lan_results, key=lambda x: x[0]):
+        status = "✓" if success else "✗"
+        print(f"  {status} {ip}: {elapsed:.1f}s")
+
+    print()
+    print(f"  Total: {total_success}/{len(lan_results)} succeeded, {total_fail} failed")
 
     total_script_time = time.time() - script_start
-    print("\n=== TIMING SUMMARY ===")
-    print(f"Total script runtime (AP + LAN): {total_script_time:.1f} seconds")
+    print(f"\n=== TIMING ===")
+    print(
+        f"  Phase A (AP provisioning): {total_ap_time:.1f}s ({len(ap_durations)} devices)"
+    )
+    print(f"  Phase B (LAN upgrades):    {lan_batch_elapsed:.1f}s")
+    print(f"  Total runtime:             {total_script_time:.1f}s")
+
     if total_success > 0:
-        avg_total_per_device = total_script_time / total_success
-        print(
-            f"Average total time per successful device: {avg_total_per_device:.1f} seconds"
-        )
-
-    if ap_durations:
-        avg_ap = sum(ap_durations) / len(ap_durations)
-        print(f"Average AP-only time per device: {avg_ap:.1f} seconds")
-
-    if lan_results and total_success > 0:
-        avg_lan = sum(elapsed for _, ok, elapsed in lan_results if ok) / total_success
-        print(f"Average LAN-only time per successful device: {avg_lan:.1f} seconds")
+        avg_total = total_script_time / total_success
+        print(f"  Average per device:        {avg_total:.1f}s")
 
     print("\nDone.")

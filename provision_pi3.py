@@ -26,7 +26,7 @@ SCAN_END_HOST = 254
 
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-MAX_DEVICES = 1
+MAX_DEVICES = 12
 
 # Stagger delay between each device starting LAN provisioning (seconds)
 STAGGER_DELAY = 15.0
@@ -78,29 +78,99 @@ def disconnect_wifi():
     run_cmd(["nmcli", "device", "disconnect", WIFI_INTERFACE])
 
 
-def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
-    disconnect_wifi()  # Drop WiFi connection
-    run_cmd(["ip", "addr", "flush", "dev", WIFI_INTERFACE])  # Clear any lingering IP
+def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
+    """Parse nmcli wifi scan output into list of dicts with SSID, BSSID, CHAN, SIGNAL."""
+    results = []
+    lines = scan_output.strip().splitlines()
+    if not lines:
+        return results
 
-    print(f"[WiFi] Scanning for {TASMOTA_AP_SSID}...")
-    run_cmd(["nmcli", "device", "wifi", "rescan"])
-    time.sleep(2)
+    # Skip header line
+    for line in lines[1:]:
+        # Format: "SSID                BSSID              CHAN  SIGNAL"
+        # Fields are separated by whitespace, but SSID might have spaces
+        parts = line.split()
+        if len(parts) >= 4:
+            # Last 3 parts are BSSID, CHAN, SIGNAL
+            # Everything before is SSID
+            signal = parts[-1]
+            chan = parts[-2]
+            bssid = parts[-3]
+            ssid = " ".join(parts[:-3])
 
-    scan_list = run_cmd(["nmcli", "-f", "SSID,CHAN,SIGNAL", "device", "wifi"])
-    lines = scan_list.stdout.splitlines()
+            if ssid.lower().startswith("accusaver"):
+                results.append(
+                    {
+                        "ssid": ssid,
+                        "bssid": bssid,
+                        "chan": chan,
+                        "signal": signal,
+                    }
+                )
 
-    accusavers = [
-        line for line in lines if line.strip().lower().startswith("accusaver")
-    ]
+    return results
 
-    print("  Available networks:")
-    if accusavers:
-        for line in accusavers:
-            print(" ", line)
+
+def connect_wifi_to_ap(
+    exclude_bssids: List[str] = None, max_wait_seconds: int = 20
+) -> Optional[str]:
+    """
+    Connect to an AccuSaver AP, excluding any BSSIDs in the exclude list.
+    Returns the BSSID we connected to, or None on failure.
+    """
+    if exclude_bssids is None:
+        exclude_bssids = []
+
+    disconnect_wifi()
+    run_cmd(["ip", "addr", "flush", "dev", WIFI_INTERFACE])
+
+    print(f"[WiFi] Scanning for {TASMOTA_AP_SSID} (fresh scan)...")
+
+    # Use --rescan yes for fresh results
+    scan_result = run_cmd(
+        [
+            "nmcli",
+            "-f",
+            "SSID,BSSID,CHAN,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            WIFI_INTERFACE,
+            "--rescan",
+            "yes",
+        ]
+    )
+
+    # Parse scan results
+    available_aps = parse_wifi_scan(scan_result.stdout)
+
+    print("  Available AccuSaver networks:")
+    if available_aps:
+        for ap in available_aps:
+            excluded = "(EXCLUDED)" if ap["bssid"] in exclude_bssids else ""
+            print(
+                f"    {ap['ssid']}  {ap['bssid']}  CH:{ap['chan']}  SIG:{ap['signal']}  {excluded}"
+            )
     else:
-        print("  (no accusavers found)")
+        print("    (no accusavers found)")
+        return None
 
-    print(f"[WiFi] Connecting {WIFI_INTERFACE} to SSID {TASMOTA_AP_SSID}...")
+    # Filter out already-provisioned BSSIDs
+    candidate_aps = [ap for ap in available_aps if ap["bssid"] not in exclude_bssids]
+
+    if not candidate_aps:
+        print("  ✗ All visible AccuSaver APs have already been provisioned")
+        return None
+
+    # Pick the strongest signal from candidates
+    target_ap = max(candidate_aps, key=lambda x: int(x["signal"]))
+    target_bssid = target_ap["bssid"]
+
+    print(
+        f"[WiFi] Connecting to BSSID {target_bssid} (signal: {target_ap['signal']})..."
+    )
+
     proc = run_cmd(
         [
             "nmcli",
@@ -108,13 +178,16 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
             "wifi",
             "connect",
             TASMOTA_AP_SSID,
+            "bssid",
+            target_bssid,
             "ifname",
             WIFI_INTERFACE,
         ]
     )
+
     if proc.returncode != 0:
         print(f"  ✗ nmcli connect error: {proc.stderr.strip()}")
-        return False
+        return None
 
     print(f"[WiFi] Waiting for 192.168.4.x on {WIFI_INTERFACE}...")
     for i in range(max_wait_seconds):
@@ -122,11 +195,11 @@ def connect_wifi_to_ap(max_wait_seconds: int = 20) -> bool:
         ip = get_current_ip(WIFI_INTERFACE)
         print(f"  AP IP check {i + 1}/{max_wait_seconds}: {ip}")
         if ip and ip.startswith("192.168.4."):
-            print(f"  ✓ On AP subnet: {ip}")
-            return True
+            print(f"  ✓ On AP subnet: {ip} (BSSID: {target_bssid})")
+            return target_bssid
 
     print("  ✗ Failed to get 192.168.4.x on Wi-Fi")
-    return False
+    return None
 
 
 def ensure_ap_http(max_attempts: int = 5) -> bool:
@@ -564,6 +637,7 @@ if __name__ == "__main__":
     ap_start = time.time()
     ap_provisioned = 0
     ap_durations: List[float] = []
+    provisioned_bssids: List[str] = []  # Track BSSIDs we've already provisioned
 
     while ap_provisioned < MAX_DEVICES:
         device_number = ap_provisioned + 1
@@ -574,11 +648,14 @@ if __name__ == "__main__":
 
         device_ap_start = time.time()
 
-        # Connect to AP
+        # Connect to AP (excluding already-provisioned BSSIDs)
         print("=== AP STEP: Connect WiFi to AccuSaver AP ===")
-        while not connect_wifi_to_ap():
-            print("✗ Could not connect to AP, retrying in 3 seconds...")
-            time.sleep(3)
+        connected_bssid = None
+        while connected_bssid is None:
+            connected_bssid = connect_wifi_to_ap(exclude_bssids=provisioned_bssids)
+            if connected_bssid is None:
+                print("✗ Could not connect to AP, retrying in 3 seconds...")
+                time.sleep(3)
 
         if not ensure_ap_http():
             print("✗ AP unreachable, skipping this device...\n")
@@ -589,6 +666,9 @@ if __name__ == "__main__":
         if not send_phase1_commands(router_ssid, router_password):
             print("✗ Phase 1 failed, skipping this device...\n")
             continue
+
+        # Track this BSSID as provisioned
+        provisioned_bssids.append(connected_bssid)
 
         # Small grace period so the device can process, then disconnect
         print("\n=== AP STEP: Disconnect and move to next device ===")
@@ -601,10 +681,12 @@ if __name__ == "__main__":
 
         print("\n==============================================================")
         print(f"✓ PHASE A SUCCESS: Device #{device_number} AP-provisioned")
+        print(f"  BSSID: {connected_bssid}")
         print(
             f"  AP provisioning time for this device: {device_ap_elapsed:.1f} seconds"
         )
         print(f"  AP-provisioned devices: {ap_provisioned}/{MAX_DEVICES}")
+        print(f"  Provisioned BSSIDs: {provisioned_bssids}")
         print("==============================================================\n")
 
     total_ap_time = time.time() - ap_start
@@ -612,7 +694,11 @@ if __name__ == "__main__":
     print(f"Total AP provisioning time: {total_ap_time:.1f} seconds")
     if ap_durations:
         avg_ap = sum(ap_durations) / len(ap_durations)
-        print(f"Average AP time per device: {avg_ap:.1f} seconds\n")
+        print(f"Average AP time per device: {avg_ap:.1f} seconds")
+    print(f"Provisioned BSSIDs ({len(provisioned_bssids)}):")
+    for bssid in provisioned_bssids:
+        print(f"  - {bssid}")
+    print()
 
     # ---------- PHASE B: LAN batch upgrade & verify ----------
 
