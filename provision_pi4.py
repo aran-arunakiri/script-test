@@ -8,6 +8,30 @@ import requests
 from requests.exceptions import ReadTimeout, ConnectionError, Timeout
 
 
+# -------- Configurable constants --------
+FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
+BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
+
+TASMOTA_AP_SSID = "accusaver-3FCAD739"
+TASMOTA_AP_IP = "192.168.4.1"
+TASMOTA_HOSTNAME = "accusaver-3FCAD739"
+
+EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
+EXPECTED_SCRIPT_VERSION = "1.0.0"
+
+WIFI_INTERFACE = "wlan0"
+LAN_INTERFACE = "eth0"
+
+SCAN_START_HOST = 1
+SCAN_END_HOST = 254
+
+IP_DISCOVERY_ORDER: List[str] = ["scan"]
+
+EXPECTED_DEVICES = 4
+
+# Stagger delay between each device starting LAN provisioning (seconds)
+STAGGER_DELAY = 15.0
+
 # -------- Progress tracking --------
 progress_lock = threading.Lock()
 device_status: Dict[str, str] = {}  # ip -> status string
@@ -32,31 +56,6 @@ def print_progress():
     # Show what each device is doing
     for ip, status in sorted(device_status.items()):
         print(f"  {ip}: {status}")
-
-
-# -------- Configurable constants --------
-FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
-BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
-
-TASMOTA_AP_SSID = "accusaver-3FCAD739"
-TASMOTA_AP_IP = "192.168.4.1"
-TASMOTA_HOSTNAME = "accusaver-3FCAD739"
-
-EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
-EXPECTED_SCRIPT_VERSION = "1.0.0"
-
-WIFI_INTERFACE = "wlan0"
-LAN_INTERFACE = "eth0"
-
-SCAN_START_HOST = 1
-SCAN_END_HOST = 254
-
-IP_DISCOVERY_ORDER: List[str] = ["scan"]
-
-EXPECTED_DEVICES = 8
-
-# Stagger delay between each device starting LAN provisioning (seconds)
-STAGGER_DELAY = 15.0
 
 
 # -------- Helpers --------
