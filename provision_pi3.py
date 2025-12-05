@@ -26,7 +26,7 @@ SCAN_END_HOST = 254
 
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-MAX_DEVICES = 12
+EXPECTED_DEVICES = 12  # Renamed from MAX_DEVICES for clarity
 
 # Stagger delay between each device starting LAN provisioning (seconds)
 STAGGER_DELAY = 15.0
@@ -109,6 +109,44 @@ def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
                 )
 
     return results
+
+
+def scan_accusaver_aps() -> List[Dict[str, str]]:
+    """
+    Scan for AccuSaver APs and return deduplicated list sorted by signal strength.
+    Used for pre-flight check.
+    """
+    print(f"[Pre-flight] Scanning for AccuSaver APs...")
+
+    scan_result = run_cmd(
+        [
+            "nmcli",
+            "-f",
+            "SSID,BSSID,CHAN,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "ifname",
+            WIFI_INTERFACE,
+            "--rescan",
+            "yes",
+        ]
+    )
+
+    all_aps = parse_wifi_scan(scan_result.stdout)
+
+    # Deduplicate by BSSID (same AP can appear multiple times in scan)
+    seen_bssids = set()
+    unique_aps = []
+    for ap in all_aps:
+        if ap["bssid"] not in seen_bssids:
+            seen_bssids.add(ap["bssid"])
+            unique_aps.append(ap)
+
+    # Sort by signal strength (highest first)
+    unique_aps.sort(key=lambda x: int(x["signal"]), reverse=True)
+
+    return unique_aps
 
 
 def connect_wifi_to_ap(
@@ -629,8 +667,33 @@ if __name__ == "__main__":
     print("=== MULTI-DEVICE MODE (HORIZONTAL) ===\n")
     print(f"Target router SSID: {router_ssid}")
     print(f"IP discovery order: {IP_DISCOVERY_ORDER}")
-    print(f"Batch size: {MAX_DEVICES}")
+    print(f"Expected devices: {EXPECTED_DEVICES}")
     print(f"Stagger delay: {STAGGER_DELAY}s\n")
+
+    # ---------- PRE-FLIGHT CHECK ----------
+
+    print("=== PRE-FLIGHT CHECK ===")
+    print("Scanning for AccuSaver APs in range...\n")
+
+    detected_aps = scan_accusaver_aps()
+    detected_count = len(detected_aps)
+
+    print(f"\nDetected {detected_count} unique AccuSaver AP(s):")
+    for ap in detected_aps:
+        print(f"  {ap['ssid']}  {ap['bssid']}  CH:{ap['chan']}  SIG:{ap['signal']}")
+
+    if detected_count != EXPECTED_DEVICES:
+        print(f"\n✗ AP count mismatch! Expected {EXPECTED_DEVICES}, found {detected_count}")
+        if detected_count < EXPECTED_DEVICES:
+            missing = EXPECTED_DEVICES - detected_count
+            print(f"  → Power on {missing} more device(s) and re-run the script")
+        else:
+            extra = detected_count - EXPECTED_DEVICES
+            print(f"  → {extra} extra device(s) in range. Update EXPECTED_DEVICES or remove extras.")
+        print("\nAborting.")
+        exit(1)
+
+    print(f"\n✓ Pre-flight check passed: {detected_count} APs detected, {EXPECTED_DEVICES} expected\n")
 
     # ---------- PHASE A: AP provisioning for N devices ----------
 
@@ -639,10 +702,10 @@ if __name__ == "__main__":
     ap_durations: List[float] = []
     provisioned_bssids: List[str] = []  # Track BSSIDs we've already provisioned
 
-    while ap_provisioned < MAX_DEVICES:
+    while ap_provisioned < EXPECTED_DEVICES:
         device_number = ap_provisioned + 1
         print("\n==============================================")
-        print(f" PHASE A: Ready for device #{device_number} of {MAX_DEVICES}")
+        print(f" PHASE A: Ready for device #{device_number} of {EXPECTED_DEVICES}")
         print(" Power on the next AccuSaver device now.")
         print("==============================================\n")
 
@@ -685,7 +748,7 @@ if __name__ == "__main__":
         print(
             f"  AP provisioning time for this device: {device_ap_elapsed:.1f} seconds"
         )
-        print(f"  AP-provisioned devices: {ap_provisioned}/{MAX_DEVICES}")
+        print(f"  AP-provisioned devices: {ap_provisioned}/{EXPECTED_DEVICES}")
         print(f"  Provisioned BSSIDs: {provisioned_bssids}")
         print("==============================================================\n")
 
@@ -710,7 +773,7 @@ if __name__ == "__main__":
         print(f"✗ {e}, cannot proceed with PHASE B.")
         exit(1)
 
-    # Discover up to MAX_DEVICES devices whose hostname starts with 'accusaver'
+    # Discover up to EXPECTED_DEVICES devices whose hostname starts with 'accusaver'
     lan_discovery_start = time.time()
     devices_found: Dict[str, str] = {}
     max_discovery_rounds = 12
@@ -725,12 +788,12 @@ if __name__ == "__main__":
                 devices_found[ip] = hostname
 
         print(
-            f"[LAN discovery] AccuSaver devices found so far: {len(devices_found)}/{MAX_DEVICES}"
+            f"[LAN discovery] AccuSaver devices found so far: {len(devices_found)}/{EXPECTED_DEVICES}"
         )
         for ip, hostname in devices_found.items():
             print(f"  - {ip} ({hostname})")
 
-        if len(devices_found) >= MAX_DEVICES:
+        if len(devices_found) >= EXPECTED_DEVICES:
             print("[LAN discovery] Found required number of devices on LAN.")
             break
 
@@ -742,9 +805,9 @@ if __name__ == "__main__":
         print("✗ No AccuSaver devices found on LAN. Cannot continue.")
         exit(1)
 
-    if len(devices_found) < MAX_DEVICES:
+    if len(devices_found) < EXPECTED_DEVICES:
         print(
-            f"✗ ERROR: Only {len(devices_found)}/{MAX_DEVICES} AccuSaver device(s) discovered on LAN."
+            f"✗ ERROR: Only {len(devices_found)}/{EXPECTED_DEVICES} AccuSaver device(s) discovered on LAN."
         )
         print("  Aborting. Make sure all devices are powered on and connected to WiFi.")
         exit(1)
@@ -784,7 +847,7 @@ if __name__ == "__main__":
     total_fail = len(lan_results) - total_success
 
     print("\n=== BATCH SUMMARY ===")
-    print(f"Batch size (expected): {MAX_DEVICES}")
+    print(f"Batch size (expected): {EXPECTED_DEVICES}")
     print(f"Devices discovered on LAN: {len(devices_found)}")
     print(f"LAN workers executed: {len(lan_results)}")
     print(f"  ✓ Success: {total_success}")
