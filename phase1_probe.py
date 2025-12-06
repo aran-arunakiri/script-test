@@ -15,15 +15,18 @@ FIRMWARE_URL = "http://192.168.2.59/tasmota32c2-withfs.bin"
 WIFI_CONFIG_FILE = ".wifi-config.json"
 
 PHASE1_MAX_RETRIES = 3
+NMCLI_CONNECT_TIMEOUT_S = 5  # max seconds nmcli can spend on a connect
 
 
 # -------- Shell helpers --------
+
 
 def run(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
 # -------- WiFi / scan --------
+
 
 def scan_accusavers() -> List[Dict[str, str]]:
     print("[Scan] nmcli scan for AccuSaver APs...")
@@ -76,10 +79,22 @@ def scan_accusavers() -> List[Dict[str, str]]:
 
 
 def connect_to_bssid(bssid: str) -> bool:
+    """
+    Fast-ish connect:
+      - disconnect wlan0 first
+      - nmcli with short timeout
+      - small post-connect delay
+    """
     print(f"\n[WiFi] Connecting to {SSID} @ {bssid}...")
+    # Ensure clean state
+    run(["nmcli", "dev", "disconnect", WIFI_IF])
+
+    t0 = time.perf_counter()
     proc = run(
         [
             "nmcli",
+            "-w",
+            str(NMCLI_CONNECT_TIMEOUT_S),
             "dev",
             "wifi",
             "connect",
@@ -90,14 +105,19 @@ def connect_to_bssid(bssid: str) -> bool:
             WIFI_IF,
         ]
     )
+    dt = time.perf_counter() - t0
     if proc.returncode != 0:
-        print("  ✗ nmcli connect error:", proc.stderr.strip())
+        print(f"  ✗ nmcli connect error (after {dt:.2f}s): {proc.stderr.strip()}")
         return False
-    time.sleep(1.0)  # small wait for DHCP
+
+    # DHCP usually lands very quickly; keep this small
+    time.sleep(0.3)
+    print(f"  ✓ nmcli connect completed in {dt:.2f}s")
     return True
 
 
 # -------- HTTP helpers --------
+
 
 def status_0() -> bool:
     """Probe device with Status 0, print a small summary."""
@@ -153,7 +173,6 @@ def send_phase1(router_ssid: str, router_password: str) -> bool:
             if resp.status_code != 200:
                 print(f"    ✗ HTTP {resp.status_code}")
             else:
-                # often JSON, but not guaranteed
                 try:
                     data = resp.json()
                 except Exception:
@@ -171,6 +190,7 @@ def send_phase1(router_ssid: str, router_password: str) -> bool:
 
 
 # -------- Main --------
+
 
 def main():
     script_start = time.perf_counter()
@@ -192,6 +212,7 @@ def main():
     success_phase1 = 0
     failures_phase1 = 0
     durations: List[float] = []
+    success_durations: List[float] = []
 
     print(
         f"[Main] Starting Phase 1 for {total} device(s) "
@@ -216,7 +237,7 @@ def main():
             print(f"  ⏱ Device duration: {elapsed:.2f}s")
             continue
 
-        status_0()  # best-effort; we don't hard-fail Phase1 on this
+        status_0()  # best-effort; informative only
 
         ok = send_phase1(router_ssid, router_password)
         if ok:
@@ -226,6 +247,9 @@ def main():
 
         elapsed = time.perf_counter() - start_t
         durations.append(elapsed)
+        if ok:
+            success_durations.append(elapsed)
+
         avg = sum(durations) / len(durations)
         print(f"  ⏱ Device duration: {elapsed:.2f}s (avg so far: {avg:.2f}s)")
 
@@ -238,7 +262,11 @@ def main():
     print(f"  ⏱ Total runtime:       {total_elapsed:.2f}s")
 
     if durations:
-        print(f"  ⏱ Avg per device:      {sum(durations)/len(durations):.2f}s")
+        print(f"  ⏱ Avg per device (all): {sum(durations)/len(durations):.2f}s")
+    if success_durations:
+        print(
+            f"  ⏱ Avg per device (success only): {sum(success_durations)/len(success_durations):.2f}s"
+        )
 
 
 if __name__ == "__main__":
