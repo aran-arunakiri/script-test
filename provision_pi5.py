@@ -51,7 +51,8 @@ def update_status(ip: str, status: str):
 
 def print_progress():
     """Print a one-line progress summary."""
-    complete = sum(1 for s in device_status.values() if s == "✓ Complete")
+    # FIX: count any status starting with ✓ / ✗, not just exact "✓ Complete"
+    complete = sum(1 for s in device_status.values() if s.startswith("✓"))
     failed = sum(1 for s in device_status.values() if s.startswith("✗"))
     in_progress = len(device_status) - complete - failed
 
@@ -455,7 +456,7 @@ def send_script_fetch(
                 if url_fetch_result == "Done":
                     return True
 
-        except requests.Timeout:
+        except Timeout:
             pass
         except Exception:
             pass
@@ -522,12 +523,36 @@ def send_reset4(ip: str) -> bool:
         return False
 
 
-def send_reset1(ip: str) -> bool:
-    try:
-        requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 1"}, timeout=5)
-        return True
-    except Exception:
-        return False
+def send_reset1(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
+    """
+    Fire factory reset (Reset 1) with retries.
+    We don't expect the device to come back online after this (it's going to the customer),
+    so:
+      * HTTP 200 = success
+      * Timeout / connection drop = very likely success (reboot in progress)
+      * Only repeated unexpected errors count as failure
+    """
+    url = f"http://{ip}/cm"
+    params = {"cmnd": "Reset 1"}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout_s)
+            if resp.status_code == 200:
+                return True
+        except Timeout:
+            # device probably rebooting mid-response -> treat as success
+            return True
+        except ConnectionError:
+            # connection dropped, also consistent with immediate reboot
+            return True
+        except Exception as e:
+            print(f"  ✗ Reset 1 error on {ip} (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            time.sleep(1.0)
+
+    return False
 
 
 def wait_for_device_online(
@@ -624,12 +649,12 @@ def provision_device_on_lan(
     # STEP B4: Reset 4 and wait online
     update_status(ip, "🔁 Rebooting...")
     if not send_reset4(ip):
-        update_status(ip, "✗ Reset failed")
+        update_status(ip, "✗ Reset 4 failed")
         return ip, False, time.time() - start
 
     time.sleep(5)
     if not wait_for_device_online(ip):
-        update_status(ip, "✗ Device offline after reboot")
+        update_status(ip, "✗ Device offline after Reset 4")
         return ip, False, time.time() - start
 
     # STEP B5: Verification
@@ -640,10 +665,17 @@ def provision_device_on_lan(
         update_status(ip, "✗ Verification failed")
         return ip, False, time.time() - start
 
-    # STEP B6: Factory reset
-    send_reset1(ip)
+    # STEP B6: Factory reset (final Reset 1, device not expected to come back)
+    update_status(ip, "🧽 Factory reset (Reset 1)...")
+    reset_ok = send_reset1(ip)
+
     elapsed = time.time() - start
-    update_status(ip, f"✓ Complete ({elapsed:.0f}s)")
+    if reset_ok:
+        update_status(ip, f"✓ Complete ({elapsed:.0f}s)")
+    else:
+        # still treat device as provisioned, but make it visible in the status text
+        update_status(ip, f"✓ Complete (reset not confirmed, {elapsed:.0f}s)")
+
     return ip, True, elapsed
 
 
@@ -727,7 +759,6 @@ if __name__ == "__main__":
             print(f"✓ Marked {connected_bssid} as provisioned")
         else:
             print(f"⚠️ Not excluding {connected_bssid} — AP connection incomplete")
-
 
         # Small grace period so the device can process, then disconnect
         print("\n=== AP STEP: Disconnect and move to next device ===")
@@ -827,7 +858,7 @@ if __name__ == "__main__":
     print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
-    with ThreadPoolExecutor(max_workers=min(len(devices_found), 18)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(devices_found), 16)) as executor:
         future_map = {}
         for idx, ip in enumerate(devices_found.keys()):
             stagger = idx * STAGGER_DELAY
