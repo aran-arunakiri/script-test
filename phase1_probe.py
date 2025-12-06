@@ -14,8 +14,9 @@ WIFI_IF = "wlan0"
 FIRMWARE_URL = "http://192.168.2.59/tasmota32c2-withfs.bin"
 WIFI_CONFIG_FILE = ".wifi-config.json"
 
-PHASE1_MAX_RETRIES = 3
+PHASE1_MAX_RETRIES = 1  # no retries, 1 shot per device
 NMCLI_CONNECT_TIMEOUT_S = 5  # max seconds nmcli can spend on a connect
+HTTP_TIMEOUT_S = 1.0  # backlog HTTP timeout
 
 
 # -------- Shell helpers --------
@@ -119,31 +120,6 @@ def connect_to_bssid(bssid: str) -> bool:
 # -------- HTTP helpers --------
 
 
-def status_0() -> bool:
-    """Probe device with Status 0, print a small summary."""
-    try:
-        resp = requests.get(
-            "http://192.168.4.1/cm",
-            params={"cmnd": "Status 0"},
-            timeout=3,
-        )
-        if resp.status_code != 200:
-            print(f"  ✗ Status 0 HTTP {resp.status_code}")
-            return False
-
-        data = resp.json()
-        status = data.get("Status", {})
-        net = data.get("StatusNET", {})
-        name = status.get("DeviceName", "")
-        topic = status.get("Topic", "")
-        ip = net.get("IPAddress", "")
-        print(f"  ✓ Status 0: name={name!r}, topic={topic!r}, ip={ip!r}")
-        return True
-    except Exception as e:
-        print(f"  ✗ Status 0 error: {e}")
-        return False
-
-
 def load_wifi_config() -> Dict[str, str]:
     with open(WIFI_CONFIG_FILE, "r") as f:
         cfg = json.load(f)
@@ -157,6 +133,7 @@ def send_phase1(router_ssid: str, router_password: str) -> bool:
     """
     Phase 1 backlog:
       Backlog0 OtaUrl <FIRMWARE_URL>; SSID1 <router_ssid>; Password1 <router_password>
+    Single attempt with short HTTP timeout.
     """
     cmd = (
         f"Backlog0 OtaUrl {FIRMWARE_URL}; "
@@ -165,11 +142,11 @@ def send_phase1(router_ssid: str, router_password: str) -> bool:
     )
 
     url = "http://192.168.4.1/cm"
-    print(f"  → Sending Phase-1 backlog...")
+    print(f"  → Sending Phase-1 backlog (timeout {HTTP_TIMEOUT_S}s)...")
     for attempt in range(1, PHASE1_MAX_RETRIES + 1):
         print(f"    attempt {attempt}/{PHASE1_MAX_RETRIES}...")
         try:
-            resp = requests.get(url, params={"cmnd": cmd}, timeout=3)
+            resp = requests.get(url, params={"cmnd": cmd}, timeout=HTTP_TIMEOUT_S)
             if resp.status_code != 200:
                 print(f"    ✗ HTTP {resp.status_code}")
             else:
@@ -182,10 +159,7 @@ def send_phase1(router_ssid: str, router_password: str) -> bool:
         except Exception as e:
             print(f"    ✗ Phase1 HTTP error: {e}")
 
-        if attempt < PHASE1_MAX_RETRIES:
-            time.sleep(1.0)
-
-    print("  ✗ Phase1 failed after retries")
+    print("  ✗ Phase1 failed")
     return False
 
 
@@ -237,8 +211,6 @@ def main():
             print(f"  ⏱ Device duration: {elapsed:.2f}s")
             continue
 
-        status_0()  # best-effort; informative only
-
         ok = send_phase1(router_ssid, router_password)
         if ok:
             success_phase1 += 1
@@ -257,15 +229,15 @@ def main():
 
     print("\n[Summary]")
     print(f"  Total devices in scan: {total}")
-    print(f"  ✓ Phase1 success:      {success_phase1}")
-    print(f"  ✗ Phase1 failed:       {failures_phase1}")
-    print(f"  ⏱ Total runtime:       {total_elapsed:.2f}s")
+    print(f"  ✓ Phase1 success:           {success_phase1}")
+    print(f"  ✗ Phase1 failed:            {failures_phase1}")
+    print(f"  ⏱ Total runtime:            {total_elapsed:.2f}s")
 
     if durations:
-        print(f"  ⏱ Avg per device (all): {sum(durations)/len(durations):.2f}s")
+        print(f"  ⏱ Avg per device (all):     {sum(durations)/len(durations):.2f}s")
     if success_durations:
         print(
-            f"  ⏱ Avg per device (success only): {sum(success_durations)/len(success_durations):.2f}s"
+            f"  ⏱ Avg per device (success): {sum(success_durations)/len(success_durations):.2f}s"
         )
 
 
