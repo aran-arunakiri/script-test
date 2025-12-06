@@ -7,7 +7,9 @@ Flow:
   2. Configure static IP 192.168.4.2/24 on wlan0 (no DHCP).
   3. Preflight: single scan of the air, collect all matching AccuSaver APs.
   4. For each BSSID seen in that preflight scan:
+       - disconnect any ongoing association
        - connect to that BSSID using `iw`
+       - wait until association is actually established
        - verify HTTP connectivity to 192.168.4.1
        - send Backlog0 (OtaUrl + SSID1 + Password1)
   5. Summary of successes / failures.
@@ -70,7 +72,6 @@ def quiesce_wifi_managers() -> None:
         if proc.returncode == 0:
             print(f"  - stopped {svc}")
         else:
-            # Non-zero is fine: service may not exist or already be inactive
             msg = proc.stderr.strip()
             if msg:
                 print(f"  - {svc}: {msg}")
@@ -103,7 +104,6 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
     """
     Single preflight scan using `iw dev <iface> scan`.
     Returns list of dicts: {ssid, bssid, signal} for APs that match our filter.
-    Fails hard if iw reports EBUSY etc.
     """
     print(f"[Scan] Preflight scan on {WIFI_INTERFACE} using iw...")
     proc = run_cmd(["iw", "dev", WIFI_INTERFACE, "scan"])
@@ -192,11 +192,15 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
 # -------- Connection + Phase 1 --------
 
 
-def connect_to_bssid_iw(bssid: str) -> bool:
+def connect_to_bssid_iw(bssid: str, max_wait_s: float = 3.0) -> bool:
     """
-    Fast-connect to a specific BSSID for TASMOTA_AP_SSID using `iw`.
+    Disconnect any existing association and connect to a specific BSSID for
+    TASMOTA_AP_SSID using `iw`. Then wait until the link shows as connected.
     Assumes open network (no WPA).
     """
+    # Ensure previous attempt isn't still "in progress"
+    run_cmd(["iw", "dev", WIFI_INTERFACE, "disconnect"])
+
     print(f"[WiFi] Fast connect to SSID {TASMOTA_AP_SSID} on BSSID {bssid}...")
     proc = run_cmd(["iw", "dev", WIFI_INTERFACE, "connect", TASMOTA_AP_SSID, bssid])
 
@@ -204,9 +208,20 @@ def connect_to_bssid_iw(bssid: str) -> bool:
         print(f"  ✗ iw connect error: {proc.stderr.strip()}")
         return False
 
-    # Give association a moment to complete
-    time.sleep(0.4)
-    return True
+    # Wait for association to really complete
+    deadline = time.time() + max_wait_s
+    last_link = ""
+    while time.time() < deadline:
+        link_proc = run_cmd(["iw", "dev", WIFI_INTERFACE, "link"])
+        last_link = link_proc.stdout.strip()
+        if "Connected to" in last_link and bssid.lower() in last_link.lower():
+            print(f"  ✓ Associated:\n    {last_link.replace(chr(10), chr(10)+'    ')}")
+            return True
+        time.sleep(0.1)
+
+    print("  ✗ Failed to associate within timeout. iw link says:")
+    print("    " + last_link.replace("\n", "\n    "))
+    return False
 
 
 def ensure_ap_http(max_attempts: int = 5) -> bool:
@@ -307,7 +322,7 @@ def main() -> None:
         print("=" * 60)
 
         if not connect_to_bssid_iw(bssid):
-            print(f"[Device {idx}] ✗ WiFi connect failed")
+            print(f"[Device {idx}] ✗ WiFi connect/associate failed")
             failures += 1
             continue
 
