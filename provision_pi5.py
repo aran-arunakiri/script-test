@@ -575,39 +575,140 @@ def wait_for_device_online(
 
 # -------- Verification --------
 
+def verify_firmware(
+    ip: str,
+    max_attempts: int = 5,
+    delay_seconds: int = 3,
+) -> bool:
+    """
+    Verify firmware build date via Status 2 with retries.
+    Logs detailed reasons on failure.
+    """
+    last_reason = "unknown"
 
-def verify_firmware(ip: str) -> bool:
-    try:
-        resp = requests.get(
-            f"http://{ip}/cm",
-            params={"cmnd": "Status 2"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(
+                f"http://{ip}/cm",
+                params={"cmnd": "Status 2"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                last_reason = f"HTTP {resp.status_code}"
+                print(
+                    f"[{ip}] verify_firmware attempt {attempt}/{max_attempts}: "
+                    f"HTTP {resp.status_code}"
+                )
+            else:
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    last_reason = f"JSON parse error: {e}"
+                    print(
+                        f"[{ip}] verify_firmware attempt {attempt}/{max_attempts}: "
+                        f"JSON parse error: {e}"
+                    )
+                else:
+                    build_date = str(
+                        data.get("StatusFWR", {}).get("BuildDateTime", "")
+                    ).strip()
+                    if build_date == EXPECTED_FIRMWARE_DATE:
+                        print(
+                            f"[{ip}] verify_firmware OK on attempt {attempt}: "
+                            f"{build_date}"
+                        )
+                        return True
+                    else:
+                        last_reason = (
+                            f"BuildDateTime mismatch: got {build_date!r}, "
+                            f"expected {EXPECTED_FIRMWARE_DATE!r}"
+                        )
+                        print(
+                            f"[{ip}] verify_firmware attempt {attempt}/{max_attempts}: "
+                            f"{last_reason}"
+                        )
+        except Exception as e:
+            last_reason = f"Exception: {e}"
+            print(
+                f"[{ip}] verify_firmware attempt {attempt}/{max_attempts} "
+                f"raised: {e}"
+            )
 
-        data = resp.json()
-        build_date = str(data.get("StatusFWR", {}).get("BuildDateTime", "")).strip()
-        return build_date == EXPECTED_FIRMWARE_DATE
-    except Exception:
-        return False
+        if attempt < max_attempts:
+            time.sleep(delay_seconds)
+
+    print(
+        f"[{ip}] verify_firmware FAILED after {max_attempts} attempts. "
+        f"Last reason: {last_reason}"
+    )
+    return False
 
 
-def verify_script(ip: str) -> bool:
-    try:
-        resp = requests.get(
-            f"http://{ip}/cm",
-            params={"cmnd": "ScriptVersion"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return False
+def verify_script(
+    ip: str,
+    max_attempts: int = 5,
+    delay_seconds: int = 3,
+) -> bool:
+    """
+    Verify Berry script version via ScriptVersion with retries.
+    Logs detailed reasons on failure.
+    """
+    last_reason = "unknown"
 
-        data = resp.json()
-        version = str(data.get("ScriptVersion", "")).strip()
-        return version == EXPECTED_SCRIPT_VERSION
-    except Exception:
-        return False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(
+                f"http://{ip}/cm",
+                params={"cmnd": "ScriptVersion"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                last_reason = f"HTTP {resp.status_code}"
+                print(
+                    f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
+                    f"HTTP {resp.status_code}"
+                )
+            else:
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    last_reason = f"JSON parse error: {e}"
+                    print(
+                        f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
+                        f"JSON parse error: {e}"
+                    )
+                else:
+                    version = str(data.get("ScriptVersion", "")).strip()
+                    if version == EXPECTED_SCRIPT_VERSION:
+                        print(
+                            f"[{ip}] verify_script OK on attempt {attempt}: "
+                            f"{version}"
+                        )
+                        return True
+                    else:
+                        last_reason = (
+                            f"ScriptVersion mismatch: got {version!r}, "
+                            f"expected {EXPECTED_SCRIPT_VERSION!r}"
+                        )
+                        print(
+                            f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
+                            f"{last_reason}"
+                        )
+        except Exception as e:
+            last_reason = f"Exception: {e}"
+            print(
+                f"[{ip}] verify_script attempt {attempt}/{max_attempts} "
+                f"raised: {e}"
+            )
+
+        if attempt < max_attempts:
+            time.sleep(delay_seconds)
+
+    print(
+        f"[{ip}] verify_script FAILED after {max_attempts} attempts. "
+        f"Last reason: {last_reason}"
+    )
+    return False
 
 
 # -------- Phase B per-device worker (LAN) --------

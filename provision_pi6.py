@@ -38,6 +38,13 @@ STAGGER_DELAY = 1.0
 # False = allow reusing APs even if their BSSID is in provisioned_bssids
 AP_EXCLUSION_ENABLED = False
 
+
+# -------- Wi-Fi / AP handling (Pi / Linux) --------
+
+# If True  → only APs whose SSID matches TASMOTA_AP_SSID exactly are used
+# If False → any SSID starting with "accusaver" is used (old behaviour)
+STRICT_SSID_MATCH = True
+
 # -------- Progress tracking --------
 progress_lock = threading.Lock()
 device_status: Dict[str, str] = {}  # ip -> status string
@@ -47,13 +54,24 @@ _last_progress_time = 0.0
 
 
 def update_status(ip: str, status: str):
-    """Update device status and refresh progress bar (single line)."""
+    """
+    Update device status:
+      - print a single per-device line when its state changes
+      - refresh the global one-line progress bar
+    """
     global device_status
     with progress_lock:
-        # Skip redundant updates
-        if device_status.get(ip) == status:
-            return
+        old = device_status.get(ip)
+        if old == status:
+            return  # no spam on identical updates
+
         device_status[ip] = status
+
+        # per-device log line
+        # (newline so we don't fight with the progress bar's \r)
+        print(f"\n{ip}: {status}")
+
+        # refresh bar
         print_progress_locked()
 
 
@@ -87,14 +105,12 @@ def print_progress_locked():
     _last_progress_len = len(padded)
 
 
-# Backwards-compatible wrapper if you still call print_progress() elsewhere
 def print_progress():
+    """External helper (e.g. initial draw)."""
     with progress_lock:
         print_progress_locked()
 
-
 # -------- Helpers --------
-
 
 def load_config():
     with open(".wifi-config.json", "r") as f:
@@ -140,8 +156,17 @@ def disconnect_wifi():
 
 
 def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
-    """Parse nmcli wifi scan output into list of dicts with SSID, BSSID, CHAN, SIGNAL."""
-    results = []
+    """
+    Parse nmcli wifi scan output into list of dicts with:
+      { "ssid", "bssid", "chan", "signal" }
+
+    Behaviour:
+      - If STRICT_SSID_MATCH is True:
+          only include APs whose SSID matches TASMOTA_AP_SSID (case-insensitive)
+      - If STRICT_SSID_MATCH is False:
+          include any SSID starting with "accusaver" (case-insensitive)
+    """
+    results: List[Dict[str, str]] = []
     lines = scan_output.strip().splitlines()
     if not lines:
         return results
@@ -151,23 +176,40 @@ def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
         # Format: "SSID                BSSID              CHAN  SIGNAL"
         # Fields are separated by whitespace, but SSID might have spaces
         parts = line.split()
-        if len(parts) >= 4:
-            # Last 3 parts are BSSID, CHAN, SIGNAL
-            # Everything before is SSID
-            signal = parts[-1]
-            chan = parts[-2]
-            bssid = parts[-3]
-            ssid = " ".join(parts[:-3])
+        if len(parts) < 4:
+            continue
 
-            if ssid.lower().startswith("accusaver"):
-                results.append(
-                    {
-                        "ssid": ssid,
-                        "bssid": bssid,
-                        "chan": chan,
-                        "signal": signal,
-                    }
-                )
+        # Last 3 parts are BSSID, CHAN, SIGNAL; everything before is SSID
+        signal = parts[-1]
+        chan = parts[-2]
+        bssid = parts[-3]
+        ssid = " ".join(parts[:-3]).strip()
+
+        if not ssid:
+            continue
+
+        ssid_l = ssid.lower()
+        target_l = TASMOTA_AP_SSID.lower()
+
+        include = False
+        if STRICT_SSID_MATCH:
+            # Only this batch, e.g. "accusaver-3FCAD739"
+            if ssid_l == target_l:
+                include = True
+        else:
+            # Any AccuSaver-style AP
+            if ssid_l.startswith("accusaver"):
+                include = True
+
+        if include:
+            results.append(
+                {
+                    "ssid": ssid,
+                    "bssid": bssid,
+                    "chan": chan,
+                    "signal": signal,
+                }
+            )
 
     return results
 
@@ -604,39 +646,141 @@ def wait_for_device_online(
 
 # -------- Verification --------
 
+def verify_firmware(
+    ip: str,
+    max_attempts: int = 5,
+    delay_seconds: int = 3,
+) -> bool:
+    """
+    Verify firmware build date via Status 2 with retries.
+    Logs detailed reasons on failure.
+    """
+    last_reason = "unknown"
 
-def verify_firmware(ip: str) -> bool:
-    try:
-        resp = requests.get(
-            f"http://{ip}/cm",
-            params={"cmnd": "Status 2"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(
+                f"http://{ip}/cm",
+                params={"cmnd": "Status 2"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                last_reason = f"HTTP {resp.status_code}"
+                print(
+                    f"[{ip}] verify_firmware attempt {attempt}/{max_attempts}: "
+                    f"HTTP {resp.status_code}"
+                )
+            else:
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    last_reason = f"JSON parse error: {e}"
+                    print(
+                        f"[{ip}] verify_firmware attempt {attempt}/{max_attempts}: "
+                        f"JSON parse error: {e}"
+                    )
+                else:
+                    build_date = str(
+                        data.get("StatusFWR", {}).get("BuildDateTime", "")
+                    ).strip()
+                    if build_date == EXPECTED_FIRMWARE_DATE:
+                        print(
+                            f"[{ip}] verify_firmware OK on attempt {attempt}: "
+                            f"{build_date}"
+                        )
+                        return True
+                    else:
+                        last_reason = (
+                            f"BuildDateTime mismatch: got {build_date!r}, "
+                            f"expected {EXPECTED_FIRMWARE_DATE!r}"
+                        )
+                        print(
+                            f"[{ip}] verify_firmware attempt {attempt}/{max_attempts}: "
+                            f"{last_reason}"
+                        )
+        except Exception as e:
+            last_reason = f"Exception: {e}"
+            print(
+                f"[{ip}] verify_firmware attempt {attempt}/{max_attempts} "
+                f"raised: {e}"
+            )
 
-        data = resp.json()
-        build_date = str(data.get("StatusFWR", {}).get("BuildDateTime", "")).strip()
-        return build_date == EXPECTED_FIRMWARE_DATE
-    except Exception:
-        return False
+        if attempt < max_attempts:
+            time.sleep(delay_seconds)
+
+    print(
+        f"[{ip}] verify_firmware FAILED after {max_attempts} attempts. "
+        f"Last reason: {last_reason}"
+    )
+    return False
 
 
-def verify_script(ip: str) -> bool:
-    try:
-        resp = requests.get(
-            f"http://{ip}/cm",
-            params={"cmnd": "ScriptVersion"},
-            timeout=10,
-        )
-        if resp.status_code != 200:
-            return False
+def verify_script(
+    ip: str,
+    max_attempts: int = 5,
+    delay_seconds: int = 3,
+) -> bool:
+    """
+    Verify Berry script version via ScriptVersion with retries.
+    Logs detailed reasons on failure.
+    """
+    last_reason = "unknown"
 
-        data = resp.json()
-        version = str(data.get("ScriptVersion", "")).strip()
-        return version == EXPECTED_SCRIPT_VERSION
-    except Exception:
-        return False
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(
+                f"http://{ip}/cm",
+                params={"cmnd": "ScriptVersion"},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                last_reason = f"HTTP {resp.status_code}"
+                print(
+                    f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
+                    f"HTTP {resp.status_code}"
+                )
+            else:
+                try:
+                    data = resp.json()
+                except Exception as e:
+                    last_reason = f"JSON parse error: {e}"
+                    print(
+                        f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
+                        f"JSON parse error: {e}"
+                    )
+                else:
+                    version = str(data.get("ScriptVersion", "")).strip()
+                    if version == EXPECTED_SCRIPT_VERSION:
+                        print(
+                            f"[{ip}] verify_script OK on attempt {attempt}: "
+                            f"{version}"
+                        )
+                        return True
+                    else:
+                        last_reason = (
+                            f"ScriptVersion mismatch: got {version!r}, "
+                            f"expected {EXPECTED_SCRIPT_VERSION!r}"
+                        )
+                        print(
+                            f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
+                            f"{last_reason}"
+                        )
+        except Exception as e:
+            last_reason = f"Exception: {e}"
+            print(
+                f"[{ip}] verify_script attempt {attempt}/{max_attempts} "
+                f"raised: {e}"
+            )
+
+        if attempt < max_attempts:
+            time.sleep(delay_seconds)
+
+    print(
+        f"[{ip}] verify_script FAILED after {max_attempts} attempts. "
+        f"Last reason: {last_reason}"
+    )
+    return False
+
 
 
 # -------- Phase B per-device worker (LAN) --------
