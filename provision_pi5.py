@@ -9,8 +9,8 @@ from requests.exceptions import ReadTimeout, ConnectionError, Timeout
 
 
 # -------- Configurable constants --------
-FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
-BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
+FIRMWARE_URL = "http://192.168.2.59/tasmota32c2-withfs.bin"
+BERRY_SCRIPT_URL = "http://192.168.2.59/autoexec.be"
 
 TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"
@@ -27,10 +27,10 @@ SCAN_END_HOST = 254
 
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-EXPECTED_DEVICES = 4
+EXPECTED_DEVICES = 18
 
 # Stagger delay between each device starting LAN provisioning (seconds)
-STAGGER_DELAY = 15.0
+STAGGER_DELAY = 1.0
 
 # Toggle: whether to exclude already-provisioned BSSIDs when picking the next AP
 # True  = old behaviour (skip provisioned BSSIDs)
@@ -827,7 +827,7 @@ if __name__ == "__main__":
     print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
-    with ThreadPoolExecutor(max_workers=min(len(devices_found), 8)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(devices_found), 18)) as executor:
         future_map = {}
         for idx, ip in enumerate(devices_found.keys()):
             stagger = idx * STAGGER_DELAY
