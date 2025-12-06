@@ -3,23 +3,25 @@
 Phase 1 provisioner for Tasmota AccuSaver devices.
 
 Flow:
-  1. Preflight: single scan of the air, collect all matching AccuSaver APs.
-  2. For each BSSID seen in that preflight scan:
-       - fast-connect to that BSSID using `iw`
+  1. Quiesce Wi-Fi managers (NetworkManager, wpa_supplicant) so iw fully controls wlan0.
+  2. Configure static IP 192.168.4.2/24 on wlan0 (no DHCP).
+  3. Preflight: single scan of the air, collect all matching AccuSaver APs.
+  4. For each BSSID seen in that preflight scan:
+       - connect to that BSSID using `iw`
        - verify HTTP connectivity to 192.168.4.1
        - send Backlog0 (OtaUrl + SSID1 + Password1)
-  3. Summary of successes / failures.
+  5. Summary of successes / failures.
 
 Assumptions:
+  - This Pi is dedicated to provisioning; it's OK to stop NetworkManager/wpa_supplicant.
   - All devices use the same AP SSID (TASMOTA_AP_SSID) and AP IP (TASMOTA_AP_IP).
-  - wlan0 gets a static IP in 192.168.4.0/24 (either by this script or externally).
-  - Wi-Fi security is open (no WPA). If not, you'll need to involve wpa_supplicant.
+  - AP is open (no WPA). If WPA is used, wpa_supplicant integration is needed.
 """
 
 import json
 import subprocess
 import time
-from typing import Optional, List, Dict
+from typing import List, Dict
 
 import requests
 
@@ -43,7 +45,7 @@ STRICT_SSID_MATCH = True
 # }
 WIFI_CONFIG_FILE = ".wifi-config.json"
 
-# Static IP we want to use for talking to the AP subnet
+# Static IP for talking to Tasmota APs
 STATIC_AP_IP = "192.168.4.2/24"
 
 # Max tries per AP for Phase 1 HTTP backlog
@@ -57,10 +59,26 @@ def run_cmd(cmd: List[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def quiesce_wifi_managers() -> None:
+    """
+    Stop services that might hold wlan0 busy.
+    Safe to call even if services don't exist.
+    """
+    print("[Init] Stopping NetworkManager / wpa_supplicant if present...")
+    for svc in ("NetworkManager", "wpa_supplicant"):
+        proc = run_cmd(["systemctl", "stop", svc])
+        if proc.returncode == 0:
+            print(f"  - stopped {svc}")
+        else:
+            # Non-zero is fine: service may not exist or already be inactive
+            msg = proc.stderr.strip()
+            if msg:
+                print(f"  - {svc}: {msg}")
+
+
 def configure_static_ap_ip() -> None:
     """
     Put WIFI_INTERFACE on STATIC_AP_IP, no DHCP.
-    This is done once at the start.
     """
     print(f"[Net] Configuring static IP {STATIC_AP_IP} on {WIFI_INTERFACE}...")
     run_cmd(["ip", "link", "set", WIFI_INTERFACE, "down"])
@@ -85,11 +103,13 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
     """
     Single preflight scan using `iw dev <iface> scan`.
     Returns list of dicts: {ssid, bssid, signal} for APs that match our filter.
+    Fails hard if iw reports EBUSY etc.
     """
-    print(f"[Scan] Preflight scan on {WIFI_INTERFACE}...")
+    print(f"[Scan] Preflight scan on {WIFI_INTERFACE} using iw...")
     proc = run_cmd(["iw", "dev", WIFI_INTERFACE, "scan"])
     if proc.returncode != 0:
         print(f"[Scan] iw error: {proc.stderr.strip()}")
+        print("       Make sure no other process manages wlan0 and run this as root.")
         return []
 
     lines = proc.stdout.splitlines()
@@ -130,7 +150,7 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
     if "ssid" in current and "bssid" in current:
         aps.append(current)
 
-    # Filter by SSID
+    # Filter + dedupe + sort
     filtered: List[Dict[str, str]] = []
     target_l = TASMOTA_AP_SSID.lower()
     for ap in aps:
@@ -150,7 +170,6 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
         if include:
             filtered.append(ap)
 
-    # Deduplicate by BSSID
     seen_bssids = set()
     unique_aps: List[Dict[str, str]] = []
     for ap in filtered:
@@ -160,7 +179,6 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
         seen_bssids.add(bssid)
         unique_aps.append(ap)
 
-    # Sort strongest signal first (signal is negative dBm -> higher is better)
     unique_aps.sort(key=lambda x: x.get("signal", -1000), reverse=True)
 
     print(f"[Scan] Found {len(unique_aps)} AP(s) matching filter:")
@@ -177,7 +195,7 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
 def connect_to_bssid_iw(bssid: str) -> bool:
     """
     Fast-connect to a specific BSSID for TASMOTA_AP_SSID using `iw`.
-    Assumes open network (no WPA). If you use WPA, wpa_supplicant needs to be involved.
+    Assumes open network (no WPA).
     """
     print(f"[WiFi] Fast connect to SSID {TASMOTA_AP_SSID} on BSSID {bssid}...")
     proc = run_cmd(["iw", "dev", WIFI_INTERFACE, "connect", TASMOTA_AP_SSID, bssid])
@@ -262,6 +280,7 @@ def main() -> None:
     router_ssid = wifi_cfg["ssid"]
     router_password = wifi_cfg["password"]
 
+    quiesce_wifi_managers()
     configure_static_ap_ip()
 
     # Preflight scan defines the batch.
