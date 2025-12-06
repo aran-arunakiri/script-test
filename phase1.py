@@ -3,21 +3,16 @@
 Phase 1 provisioner for Tasmota AccuSaver devices.
 
 Flow:
-  1. Quiesce Wi-Fi managers (NetworkManager, wpa_supplicant) so iw fully controls wlan0.
-  2. Configure static IP 192.168.4.2/24 on wlan0 (no DHCP).
+  1. Stop NetworkManager / wpa_supplicant so nothing else touches wlan0.
+  2. Bring wlan0 up (no static IP; we'll use DHCP per AP).
   3. Preflight: single scan of the air, collect all matching AccuSaver APs.
   4. For each BSSID seen in that preflight scan:
-       - disconnect any ongoing association
+       - disconnect any association
        - connect to that BSSID using `iw`
-       - wait until association is actually established
+       - run `dhclient -4 -1 wlan0` to get a 192.168.4.x lease
        - verify HTTP connectivity to 192.168.4.1
        - send Backlog0 (OtaUrl + SSID1 + Password1)
   5. Summary of successes / failures.
-
-Assumptions:
-  - This Pi is dedicated to provisioning; it's OK to stop NetworkManager/wpa_supplicant.
-  - All devices use the same AP SSID (TASMOTA_AP_SSID) and AP IP (TASMOTA_AP_IP).
-  - AP is open (no WPA). If WPA is used, wpa_supplicant integration is needed.
 """
 
 import json
@@ -36,21 +31,10 @@ TASMOTA_AP_IP = "192.168.4.1"
 
 WIFI_INTERFACE = "wlan0"
 
-# If True  → only SSID exactly equal to TASMOTA_AP_SSID (case-insensitive)
-# If False → accept any SSID starting with "accusaver"
-STRICT_SSID_MATCH = True
+STRICT_SSID_MATCH = True  # True = exact SSID, False = any ssid.startswith("accusaver")
 
-# WiFi creds for customer router are read from .wifi-config.json:
-# {
-#   "ssid": "your-router-ssid",
-#   "password": "your-router-password"
-# }
-WIFI_CONFIG_FILE = ".wifi-config.json"
+WIFI_CONFIG_FILE = ".wifi-config.json"  # router SSID + password for Phase 1 backlog
 
-# Static IP for talking to Tasmota APs
-STATIC_AP_IP = "192.168.4.2/24"
-
-# Max tries per AP for Phase 1 HTTP backlog
 PHASE1_MAX_RETRIES = 3
 
 
@@ -62,10 +46,6 @@ def run_cmd(cmd: List[str]) -> subprocess.CompletedProcess:
 
 
 def quiesce_wifi_managers() -> None:
-    """
-    Stop services that might hold wlan0 busy.
-    Safe to call even if services don't exist.
-    """
     print("[Init] Stopping NetworkManager / wpa_supplicant if present...")
     for svc in ("NetworkManager", "wpa_supplicant"):
         proc = run_cmd(["systemctl", "stop", svc])
@@ -77,14 +57,10 @@ def quiesce_wifi_managers() -> None:
                 print(f"  - {svc}: {msg}")
 
 
-def configure_static_ap_ip() -> None:
-    """
-    Put WIFI_INTERFACE on STATIC_AP_IP, no DHCP.
-    """
-    print(f"[Net] Configuring static IP {STATIC_AP_IP} on {WIFI_INTERFACE}...")
+def bringup_wlan() -> None:
+    print(f"[Net] Bringing {WIFI_INTERFACE} up (no IP yet)...")
     run_cmd(["ip", "link", "set", WIFI_INTERFACE, "down"])
     run_cmd(["ip", "addr", "flush", "dev", WIFI_INTERFACE])
-    run_cmd(["ip", "addr", "add", STATIC_AP_IP, "dev", WIFI_INTERFACE])
     run_cmd(["ip", "link", "set", WIFI_INTERFACE, "up"])
 
 
@@ -101,52 +77,41 @@ def load_wifi_config() -> Dict[str, str]:
 
 
 def scan_accusaver_aps() -> List[Dict[str, str]]:
-    """
-    Single preflight scan using `iw dev <iface> scan`.
-    Returns list of dicts: {ssid, bssid, signal} for APs that match our filter.
-    """
     print(f"[Scan] Preflight scan on {WIFI_INTERFACE} using iw...")
     proc = run_cmd(["iw", "dev", WIFI_INTERFACE, "scan"])
     if proc.returncode != 0:
         print(f"[Scan] iw error: {proc.stderr.strip()}")
-        print("       Make sure no other process manages wlan0 and run this as root.")
+        print("       Make sure no other process manages wlan0 and run as root.")
         return []
 
     lines = proc.stdout.splitlines()
     aps: List[Dict[str, str]] = []
-
     current: Dict[str, str] = {}
+
     for raw_line in lines:
         line = raw_line.strip()
 
-        # Example: "BSS aa:bb:cc:dd:ee:ff(on wlan0)"
         if line.startswith("BSS "):
-            # commit previous AP if it had SSID
             if "ssid" in current and "bssid" in current:
                 aps.append(current)
             current = {}
-
             parts = line.split()
             if len(parts) >= 2:
                 bssid = parts[1]
-                # strip trailing '(on' if present
                 if "(" in bssid:
                     bssid = bssid.split("(")[0]
                 current["bssid"] = bssid.lower()
 
         elif line.startswith("SSID:"):
-            ssid = line[len("SSID:") :].strip()
-            current["ssid"] = ssid
+            current["ssid"] = line[len("SSID:") :].strip()
 
         elif line.startswith("signal:"):
-            # example "signal: -42.00 dBm"
             sig_str = line[len("signal:") :].strip().split()[0]
             try:
                 current["signal"] = int(float(sig_str))
             except ValueError:
-                current["signal"] = -1000  # fallback
+                current["signal"] = -1000
 
-    # commit last AP if present
     if "ssid" in current and "bssid" in current:
         aps.append(current)
 
@@ -189,16 +154,11 @@ def scan_accusaver_aps() -> List[Dict[str, str]]:
     return unique_aps
 
 
-# -------- Connection + Phase 1 --------
+# -------- Connection + DHCP + Phase 1 --------
 
 
 def connect_to_bssid_iw(bssid: str, max_wait_s: float = 3.0) -> bool:
-    """
-    Disconnect any existing association and connect to a specific BSSID for
-    TASMOTA_AP_SSID using `iw`. Then wait until the link shows as connected.
-    Assumes open network (no WPA).
-    """
-    # Ensure previous attempt isn't still "in progress"
+    # ensure clean state
     run_cmd(["iw", "dev", WIFI_INTERFACE, "disconnect"])
 
     print(f"[WiFi] Fast connect to SSID {TASMOTA_AP_SSID} on BSSID {bssid}...")
@@ -224,11 +184,25 @@ def connect_to_bssid_iw(bssid: str, max_wait_s: float = 3.0) -> bool:
     return False
 
 
+def dhcp_for_ap(max_wait_s: float = 4.0) -> bool:
+    """
+    Run a one-shot DHCP request on wlan0 to get 192.168.4.x from the AP.
+    Requires dhclient installed.
+    """
+    print("[DHCP] Requesting address on wlan0...")
+    # -1 = single attempt in foreground, -4 = IPv4 only
+    proc = run_cmd(["dhclient", "-4", "-1", WIFI_INTERFACE])
+    if proc.returncode != 0:
+        print(f"  ✗ dhclient error: {proc.stderr.strip()}")
+        return False
+
+    # quick sanity check that we have some IPv4 now
+    addr_proc = run_cmd(["ip", "-4", "addr", "show", WIFI_INTERFACE])
+    print("  ip addr:\n    " + addr_proc.stdout.replace("\n", "\n    "))
+    return True
+
+
 def ensure_ap_http(max_attempts: int = 5) -> bool:
-    """
-    Quick sanity check that http://192.168.4.1 responds.
-    Short timeouts to keep total phase time small.
-    """
     print("[Phase 1] Checking HTTP connectivity to Tasmota AP...")
     url = f"http://{TASMOTA_AP_IP}"
     for attempt in range(1, max_attempts + 1):
@@ -249,11 +223,6 @@ def ensure_ap_http(max_attempts: int = 5) -> bool:
 
 
 def send_phase1_commands(router_ssid: str, router_password: str) -> bool:
-    """
-    Phase 1 = send:
-      Backlog0 OtaUrl <FIRMWARE_URL>; SSID1 <router_ssid>; Password1 <router_password>
-    to the AP at 192.168.4.1.
-    """
     commands = (
         f"Backlog0 OtaUrl {FIRMWARE_URL}; "
         f"SSID1 {router_ssid}; "
@@ -296,9 +265,8 @@ def main() -> None:
     router_password = wifi_cfg["password"]
 
     quiesce_wifi_managers()
-    configure_static_ap_ip()
+    bringup_wlan()
 
-    # Preflight scan defines the batch.
     aps = scan_accusaver_aps()
     if not aps:
         print("[Main] No AccuSaver APs found during preflight – nothing to do.")
@@ -309,8 +277,7 @@ def main() -> None:
     failures = 0
 
     print(
-        f"[Main] Starting Phase 1 for {total} device(s) "
-        f"(only those seen during preflight)."
+        f"[Main] Starting Phase 1 for {total} device(s) (only those seen during preflight)."
     )
 
     for idx, ap in enumerate(aps, start=1):
@@ -323,6 +290,11 @@ def main() -> None:
 
         if not connect_to_bssid_iw(bssid):
             print(f"[Device {idx}] ✗ WiFi connect/associate failed")
+            failures += 1
+            continue
+
+        if not dhcp_for_ap():
+            print(f"[Device {idx}] ✗ DHCP failed")
             failures += 1
             continue
 
