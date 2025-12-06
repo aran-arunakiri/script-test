@@ -2,7 +2,7 @@
 import subprocess
 import json
 import time
-from typing import List, Dict
+from typing import List, Dict, Set
 
 import requests
 
@@ -14,9 +14,13 @@ WIFI_IF = "wlan0"
 FIRMWARE_URL = "http://192.168.2.59/tasmota32c2-withfs.bin"
 WIFI_CONFIG_FILE = ".wifi-config.json"
 
-PHASE1_MAX_RETRIES = 1  # no retries, 1 shot per device
+PHASE1_MAX_RETRIES = 1  # one HTTP attempt per connect
 NMCLI_CONNECT_TIMEOUT_S = 5  # max seconds nmcli can spend on a connect
 HTTP_TIMEOUT_S = 1.0  # backlog HTTP timeout
+
+EXPECTED_DEVICES = 4  # <-- set to 18 in production
+MAX_ROUNDS = 30  # safety guard so we don't loop forever
+NO_NEW_AP_SLEEP_S = 3.0  # wait between rounds when nothing new is seen
 
 
 # -------- Shell helpers --------
@@ -111,7 +115,6 @@ def connect_to_bssid(bssid: str) -> bool:
         print(f"  ✗ nmcli connect error (after {dt:.2f}s): {proc.stderr.strip()}")
         return False
 
-    # DHCP usually lands very quickly; keep this small
     time.sleep(0.3)
     print(f"  ✓ nmcli connect completed in {dt:.2f}s")
     return True
@@ -177,68 +180,111 @@ def main():
         print(f"[Main] ✗ Failed to load {WIFI_CONFIG_FILE}: {e}")
         return
 
-    aps = scan_accusavers()
-    if not aps:
-        print("[Main] No APs, nothing to do.")
-        return
-
-    total = len(aps)
-    success_phase1 = 0
-    failures_phase1 = 0
+    success_bssids: Set[str] = set()
     durations: List[float] = []
     success_durations: List[float] = []
+    attempts = 0
 
     print(
-        f"[Main] Starting Phase 1 for {total} device(s) "
-        "(only those seen during this scan)."
+        f"[Main] Target: Phase 1 success on {EXPECTED_DEVICES} device(s). "
+        f"Max rounds: {MAX_ROUNDS}"
     )
 
-    for idx, ap in enumerate(aps, start=1):
-        bssid = ap["bssid"]
-        sig = ap["signal"]
+    for round_idx in range(1, MAX_ROUNDS + 1):
+        print("\n" + "#" * 60)
+        print(
+            f"[Round {round_idx}/{MAX_ROUNDS}] "
+            f"Success so far: {len(success_bssids)}/{EXPECTED_DEVICES}"
+        )
+        print("#" * 60)
 
-        print("\n" + "=" * 60)
-        print(f"[Device {idx}/{total}] BSSID {bssid} SIG:{sig}")
-        print("=" * 60)
+        if len(success_bssids) >= EXPECTED_DEVICES:
+            print("[Main] Target reached, stopping rounds.")
+            break
 
-        start_t = time.perf_counter()
+        aps = scan_accusavers()
+        if not aps:
+            print("  No APs visible this round.")
+        # only attempt devices we haven't already succeeded on
+        candidates = [ap for ap in aps if ap["bssid"] not in success_bssids]
 
-        if not connect_to_bssid(bssid):
-            print(f"[Device {idx}] ✗ WiFi connect failed")
-            failures_phase1 += 1
-            elapsed = time.perf_counter() - start_t
-            durations.append(elapsed)
-            print(f"  ⏱ Device duration: {elapsed:.2f}s")
+        if not candidates:
+            print("  No new APs to process this round, sleeping a bit...")
+            time.sleep(NO_NEW_AP_SLEEP_S)
             continue
 
-        ok = send_phase1(router_ssid, router_password)
-        if ok:
-            success_phase1 += 1
-        else:
-            failures_phase1 += 1
+        total_this_round = len(candidates)
+        print(f"  Candidates this round (not yet successful): {total_this_round}")
 
-        elapsed = time.perf_counter() - start_t
-        durations.append(elapsed)
-        if ok:
-            success_durations.append(elapsed)
+        for idx, ap in enumerate(candidates, start=1):
+            if len(success_bssids) >= EXPECTED_DEVICES:
+                print("  Target reached mid-round, breaking.")
+                break
 
-        avg = sum(durations) / len(durations)
-        print(f"  ⏱ Device duration: {elapsed:.2f}s (avg so far: {avg:.2f}s)")
+            bssid = ap["bssid"]
+            sig = ap["signal"]
+            attempts += 1
+
+            print("\n" + "=" * 60)
+            print(
+                f"[Device attempt #{attempts}] "
+                f"BSSID {bssid} SIG:{sig} "
+                f"(round {round_idx}, candidate {idx}/{total_this_round})"
+            )
+            print("=" * 60)
+
+            start_t = time.perf_counter()
+
+            if not connect_to_bssid(bssid):
+                print("  ✗ WiFi connect failed for this attempt")
+                elapsed = time.perf_counter() - start_t
+                durations.append(elapsed)
+                print(f"  ⏱ Attempt duration: {elapsed:.2f}s")
+                continue
+
+            ok = send_phase1(router_ssid, router_password)
+            elapsed = time.perf_counter() - start_t
+            durations.append(elapsed)
+
+            if ok:
+                success_bssids.add(bssid)
+                success_durations.append(elapsed)
+                print(
+                    f"  ✓ Phase1 success for {bssid} in {elapsed:.2f}s "
+                    f"(total successes: {len(success_bssids)}/{EXPECTED_DEVICES})"
+                )
+            else:
+                print(
+                    f"  ✗ Phase1 failed for {bssid} (this attempt, will retry in later rounds)"
+                )
+
+            avg = sum(durations) / len(durations)
+            print(
+                f"  ⏱ Attempt duration: {elapsed:.2f}s (avg over attempts: {avg:.2f}s)"
+            )
+
+        # small pause between rounds to let devices reboot / leave AP mode
+        time.sleep(1.0)
 
     total_elapsed = time.perf_counter() - script_start
 
     print("\n[Summary]")
-    print(f"  Total devices in scan: {total}")
-    print(f"  ✓ Phase1 success:           {success_phase1}")
-    print(f"  ✗ Phase1 failed:            {failures_phase1}")
-    print(f"  ⏱ Total runtime:            {total_elapsed:.2f}s")
+    print(f"  Target devices:                {EXPECTED_DEVICES}")
+    print(f"  Unique BSSIDs successful:      {len(success_bssids)}")
+    print(f"  Total attempts:                {attempts}")
+    print(f"  ⏱ Total runtime:               {total_elapsed:.2f}s")
 
     if durations:
-        print(f"  ⏱ Avg per device (all):     {sum(durations)/len(durations):.2f}s")
+        print(f"  ⏱ Avg per attempt (all):       {sum(durations)/len(durations):.2f}s")
     if success_durations:
         print(
-            f"  ⏱ Avg per device (success): {sum(success_durations)/len(success_durations):.2f}s"
+            f"  ⏱ Avg per success attempt:     {sum(success_durations)/len(success_durations):.2f}s"
         )
+
+    if len(success_bssids) < EXPECTED_DEVICES:
+        print("\n[Main] ⚠ Did NOT reach expected device count.")
+    else:
+        print("\n[Main] ✓ Reached expected device count.")
 
 
 if __name__ == "__main__":
