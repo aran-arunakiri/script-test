@@ -720,8 +720,14 @@ if __name__ == "__main__":
             print("✗ Phase 1 failed, skipping this device...\n")
             continue
 
-        # Track this BSSID as provisioned
-        provisioned_bssids.append(connected_bssid)
+        # Track only if AP connection actually succeeded
+        ip = get_current_ip(WIFI_INTERFACE)
+        if ip and ip.startswith("192.168.4."):
+            provisioned_bssids.append(connected_bssid)
+            print(f"✓ Marked {connected_bssid} as provisioned")
+        else:
+            print(f"⚠️ Not excluding {connected_bssid} — AP connection incomplete")
+
 
         # Small grace period so the device can process, then disconnect
         print("\n=== AP STEP: Disconnect and move to next device ===")
