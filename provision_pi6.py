@@ -6,7 +6,6 @@ from typing import Optional, List, Dict, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from requests.exceptions import ReadTimeout, ConnectionError, Timeout
-import sys
 
 
 # -------- Configurable constants --------
@@ -38,9 +37,6 @@ STAGGER_DELAY = 1.0
 # False = allow reusing APs even if their BSSID is in provisioned_bssids
 AP_EXCLUSION_ENABLED = False
 
-
-# -------- Wi-Fi / AP handling (Pi / Linux) --------
-
 # If True  → only APs whose SSID matches TASMOTA_AP_SSID exactly are used
 # If False → any SSID starting with "accusaver" is used (old behaviour)
 STRICT_SSID_MATCH = True
@@ -49,68 +45,31 @@ STRICT_SSID_MATCH = True
 progress_lock = threading.Lock()
 device_status: Dict[str, str] = {}  # ip -> status string
 
-_last_progress_len = 0
-_last_progress_time = 0.0
-
 
 def update_status(ip: str, status: str):
-    """
-    Update device status:
-      - print a single per-device line when its state changes
-      - refresh the global one-line progress bar
-    """
-    global device_status
+    """Update device status and print progress summary."""
     with progress_lock:
-        old = device_status.get(ip)
-        if old == status:
-            return  # no spam on identical updates
-
         device_status[ip] = status
-
-        # per-device log line
-        # (newline so we don't fight with the progress bar's \r)
-        print(f"\n{ip}: {status}")
-
-        # refresh bar
-        print_progress_locked()
-
-
-def print_progress_locked():
-    """Print a single-line progress bar. Caller must hold progress_lock."""
-    global _last_progress_len, _last_progress_time
-
-    now = time.time()
-    # throttle updates to avoid excessive flicker (max ~5 per second)
-    if now - _last_progress_time < 0.2:
-        return
-    _last_progress_time = now
-
-    total = len(device_status)
-    complete = sum(1 for s in device_status.values() if s.startswith("✓"))
-    failed = sum(1 for s in device_status.values() if s.startswith("✗"))
-    in_progress = total - complete - failed
-
-    bar_width = 30
-    done = complete + failed
-    frac = (done / total) if total > 0 else 0.0
-    done_chars = int(bar_width * frac)
-    bar = "#" * done_chars + "-" * (bar_width - done_chars)
-
-    line = f"[{bar}] ✓ {complete}/{total} complete | ✗ {failed} failed | ⋯ {in_progress} in progress"
-
-    # overwrite same line; pad with spaces to fully clear previous content
-    padded = line.ljust(_last_progress_len)
-    sys.stdout.write("\r" + padded)
-    sys.stdout.flush()
-    _last_progress_len = len(padded)
+        print_progress()
 
 
 def print_progress():
-    """External helper (e.g. initial draw)."""
-    with progress_lock:
-        print_progress_locked()
+    """Print a one-line progress summary + per-device lines."""
+    # Count any status starting with ✓ / ✗
+    complete = sum(1 for s in device_status.values() if s.startswith("✓"))
+    failed = sum(1 for s in device_status.values() if s.startswith("✗"))
+    in_progress = len(device_status) - complete - failed
+
+    status_line = f"[PROGRESS] ✓ {complete} complete | ⋯ {in_progress} in progress | ✗ {failed} failed"
+    print(f"\n{status_line}")
+
+    # Show what each device is doing
+    for ip, status in sorted(device_status.items()):
+        print(f"  {ip}: {status}")
+
 
 # -------- Helpers --------
+
 
 def load_config():
     with open(".wifi-config.json", "r") as f:
@@ -157,8 +116,7 @@ def disconnect_wifi():
 
 def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
     """
-    Parse nmcli wifi scan output into list of dicts with:
-      { "ssid", "bssid", "chan", "signal" }
+    Parse nmcli wifi scan output into list of dicts with SSID, BSSID, CHAN, SIGNAL.
 
     Behaviour:
       - If STRICT_SSID_MATCH is True:
@@ -193,11 +151,9 @@ def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
 
         include = False
         if STRICT_SSID_MATCH:
-            # Only this batch, e.g. "accusaver-3FCAD739"
             if ssid_l == target_l:
                 include = True
         else:
-            # Any AccuSaver-style AP
             if ssid_l.startswith("accusaver"):
                 include = True
 
@@ -782,7 +738,6 @@ def verify_script(
     return False
 
 
-
 # -------- Phase B per-device worker (LAN) --------
 
 
@@ -1028,7 +983,6 @@ if __name__ == "__main__":
         device_status[ip] = "⏳ Queued"
 
     print("\n=== PHASE B: Starting parallel upgrades ===")
-    # initial progress bar draw
     print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
@@ -1049,9 +1003,6 @@ if __name__ == "__main__":
                 lan_results.append((ip, False, 0.0))
 
     lan_batch_elapsed = time.time() - lan_batch_start
-
-    # Move to a new line after the live progress bar
-    print()
 
     # ---------- Final Summary ----------
 
