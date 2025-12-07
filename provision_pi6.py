@@ -540,14 +540,39 @@ def wait_for_script_after_safeboot(
 
 
 # -------- Resets and online wait --------
+def send_reset4(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
+    """
+    Send Reset 4 (soft reboot) with retries.
 
+    Similar semantics to send_reset1:
+      * HTTP 200 = success
+      * Timeout / connection drop = very likely success (reboot in progress)
+      * Only repeated unexpected errors count as failure
 
-def send_reset4(ip: str) -> bool:
-    try:
-        requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 4"}, timeout=5)
-        return True
-    except Exception:
-        return False
+    The *real* check that the device is back online is done by
+    wait_for_device_online() afterwards.
+    """
+    url = f"http://{ip}/cm"
+    params = {"cmnd": "Reset 4"}
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout_s)
+            if resp.status_code == 200:
+                return True
+        except Timeout:
+            # device probably rebooting mid-response -> treat as success
+            return True
+        except ConnectionError:
+            # connection dropped, also consistent with immediate reboot
+            return True
+        except Exception as e:
+            print(f"  ✗ Reset 4 error on {ip} (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            time.sleep(1.0)
+
+    return False
 
 
 def send_reset1(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
@@ -601,6 +626,7 @@ def wait_for_device_online(
 
 
 # -------- Verification --------
+
 
 def verify_firmware(
     ip: str,
@@ -724,8 +750,7 @@ def verify_script(
         except Exception as e:
             last_reason = f"Exception: {e}"
             print(
-                f"[{ip}] verify_script attempt {attempt}/{max_attempts} "
-                f"raised: {e}"
+                f"[{ip}] verify_script attempt {attempt}/{max_attempts} " f"raised: {e}"
             )
 
         if attempt < max_attempts:
