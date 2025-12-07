@@ -1011,7 +1011,7 @@ if __name__ == "__main__":
     print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
-    with ThreadPoolExecutor(max_workers=min(len(devices_found), 16)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(devices_found), 32)) as executor:
         future_map = {}
         for idx, ip in enumerate(devices_found.keys()):
             stagger = idx * STAGGER_DELAY
