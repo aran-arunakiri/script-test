@@ -525,7 +525,9 @@ end)
 tasmota.add_cmd("ECOMODE", def(cmd, idx, payload, payload_json)
   if payload
     if payload == "1" || string.tolower(payload) == "on" || string.tolower(payload) == "true"
-      reset_calibration_data()
+      if !is_calibrating
+        reset_calibration_data()
+      end
       eco_mode_enabled = true
       update_eco_state()
       save_data()
