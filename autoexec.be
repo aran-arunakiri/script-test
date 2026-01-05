@@ -501,7 +501,7 @@ def monitor_energy()
 end
 
 # Register StartCal command that accepts battery percentage
-tasmota.add_cmd("StartCal", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("STARTCAL", def(cmd, idx, payload, payload_json)
   var percentage = nil
 
   if payload
@@ -517,7 +517,7 @@ tasmota.add_cmd("StartCal", def(cmd, idx, payload, payload_json)
 end)
 
 # Register manual EndCal command
-tasmota.add_cmd("EndCal", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("ENDCAL", def(cmd, idx, payload, payload_json)
   if is_calibrating
     var result = end_calibration()
     tasmota.resp_cmnd({"EndCal": result})
@@ -527,7 +527,7 @@ tasmota.add_cmd("EndCal", def(cmd, idx, payload, payload_json)
 end)
 
 # Register EcoMode command to enable/disable eco mode
-tasmota.add_cmd("EcoMode", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("ECOMODE", def(cmd, idx, payload, payload_json)
   if payload
     if payload == "1" || string.tolower(payload) == "on" || string.tolower(payload) == "true"
       reset_calibration_data()
@@ -547,12 +547,12 @@ tasmota.add_cmd("EcoMode", def(cmd, idx, payload, payload_json)
 end)
 
 # Register history command
-tasmota.add_cmd("ChargingHistory", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("CHARGINGHISTORY", def(cmd, idx, payload, payload_json)
   tasmota.resp_cmnd({"ChargingHistory": charging_history})
 end)
 
 # Register daily summary command
-tasmota.add_cmd("DailySummary", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("DAILYSUMMARY", def(cmd, idx, payload, payload_json)
   summary_days = {}
 
   for i: 0..charging_history.size()-1
@@ -575,7 +575,7 @@ tasmota.add_cmd("DailySummary", def(cmd, idx, payload, payload_json)
 end)
 
 # Register status command
-tasmota.add_cmd("BatteryStatus", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("BATTERYSTATUS", def(cmd, idx, payload, payload_json)
   var status = {
     "calibration_active": is_calibrating,
     "eco_mode": eco_mode_enabled,
@@ -612,12 +612,12 @@ tasmota.add_cmd("BatteryStatus", def(cmd, idx, payload, payload_json)
 end)
 
 # Register script version command
-tasmota.add_cmd("ScriptVersion", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("SCRIPTVERSION", def(cmd, idx, payload, payload_json)
   tasmota.resp_cmnd({"ScriptVersion": {"version": script_version}})
 end)
 
 # Register WeekdayAverage command
-tasmota.add_cmd("WeekdayAverage", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("WEEKDAYAVERAGE", def(cmd, idx, payload, payload_json)
   var averages = {}
   var days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -647,7 +647,7 @@ tasmota.add_cmd("WeekdayAverage", def(cmd, idx, payload, payload_json)
 end)
 
 # Register RecalculateStats command to rebuild statistics from history
-tasmota.add_cmd("RecalculateStats", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("RECALCULATESTATS", def(cmd, idx, payload, payload_json)
   rebuild_weekday_totals()
   save_data()
   tasmota.resp_cmnd({"RecalculateStats": {"status": "completed", "sessions_processed": charging_history.size()}})
@@ -713,13 +713,13 @@ def generate_test_data()
 end
 
 # Register test data command
-tasmota.add_cmd("GenerateTestData", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("GENERATETESTDATA", def(cmd, idx, payload, payload_json)
   var result = generate_test_data()
   tasmota.resp_cmnd({"GenerateTestData": result})
 end)
 
 # Add a SetCapacity command so you can fake the calibration via curl
-tasmota.add_cmd("SetCapacity", def(cmd, idx, payload, payload_json)
+tasmota.add_cmd("SETCAPACITY", def(cmd, idx, payload, payload_json)
   if payload
     total_battery_capacity = number(payload)
     update_eco_state()
