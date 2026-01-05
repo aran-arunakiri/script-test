@@ -68,26 +68,6 @@ def update_eco_state()
   end
 end
 
-def reset_calibration_data()
-  calibration_start_total = nil
-  calibration_start_time = nil
-  start_battery_percentage = nil
-  is_calibrating = false
-  total_battery_capacity = nil
-  charging_start_total = nil
-  charging_start_time = nil
-  is_charging = false
-  charging_history = []
-  init_weekday_totals()
-  update_eco_state()
-
-  try
-    tasmota.cmd('FileDelete /battery_manager.json')
-  except .. as e
-    log("Error deleting battery_manager.json: " + str(e), 2)
-  end
-end
-
 # Initialize weekday totals structure
 def init_weekday_totals()
   var weekday_names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
@@ -217,6 +197,21 @@ def save_data()
   except .. as e
     log("Error saving data: " + str(e), 2)
   end
+end
+
+def reset_calibration_data()
+  calibration_start_total = nil
+  calibration_start_time = nil
+  start_battery_percentage = nil
+  is_calibrating = false
+  total_battery_capacity = nil
+  charging_start_total = nil
+  charging_start_time = nil
+  is_charging = false
+  charging_history = []
+  init_weekday_totals()
+  update_eco_state()
+  save_data()
 end
 
 # Log a charging session to history
