@@ -48,6 +48,7 @@ var start_battery_percentage = nil
 var is_calibrating = false
 var eco_mode_enabled = false
 var eco_state = "off"  # off | pending | active
+var script_version = "1.0"
 var total_battery_capacity = nil
 var charging_start_total = nil
 var charging_start_time = nil
@@ -64,6 +65,26 @@ def update_eco_state()
     eco_state = "active"
   else
     eco_state = "pending"
+  end
+end
+
+def reset_calibration_data()
+  calibration_start_total = nil
+  calibration_start_time = nil
+  start_battery_percentage = nil
+  is_calibrating = false
+  total_battery_capacity = nil
+  charging_start_total = nil
+  charging_start_time = nil
+  is_charging = false
+  charging_history = []
+  init_weekday_totals()
+  update_eco_state()
+
+  try
+    tasmota.cmd('FileDelete /battery_manager.json')
+  except .. as e
+    log("Error deleting battery_manager.json: " + str(e), 2)
   end
 end
 
@@ -90,22 +111,22 @@ end
 def get_current_weekday_average()
   var now = tasmota.rtc()["local"]
   var weekday = get_weekday_name(now)
-  
+
   if weekday_totals.contains(weekday) && weekday_totals[weekday]["session_count"] > 0
     return weekday_totals[weekday]["total_energy"] / weekday_totals[weekday]["session_count"]
   end
-  
+
   return nil
 end
 
 # Update weekday totals when logging a session
 def update_weekday_totals(session)
   var weekday = get_weekday_name(session["start_time"])
-  
+
   if !weekday_totals.contains(weekday)
     init_weekday_totals()
   end
-  
+
   weekday_totals[weekday]["total_energy"] += session["energy_used"]
   weekday_totals[weekday]["session_count"] += 1
   if session["eco_mode_active"]
@@ -116,7 +137,7 @@ end
 # Rebuild weekday totals from history (for initial load or recalculation)
 def rebuild_weekday_totals()
   init_weekday_totals()
-  
+
   for session: charging_history
     update_weekday_totals(session)
   end
@@ -135,17 +156,17 @@ try
       calibration_start_time = data.find("calibration_start_time")
       start_battery_percentage = data.find("start_battery_percentage")
       is_calibrating = data.find("is_calibrating") || false
-      
+
       # Load eco mode data
       eco_mode_enabled = data.find("eco_mode_enabled") || false
       total_battery_capacity = data.find("total_battery_capacity")
       eco_state = data.find("eco_state") || eco_state
-      
+
       # Load charging history
       if data.find("charging_history")
         charging_history = data["charging_history"]
       end
-      
+
       # Load weekday totals
       if data.find("weekday_totals")
         weekday_totals = data["weekday_totals"]
@@ -153,14 +174,14 @@ try
         # Rebuild from history if not found
         rebuild_weekday_totals()
       end
-      
+
       update_eco_state()
-      
+
       if is_calibrating
         log("Resuming calibration in progress:", 3)
         log("  Battery level: " + str(start_battery_percentage) + "%", 3)
       end
-      
+
       if eco_mode_enabled
         log("Eco mode is enabled", 3)
         if total_battery_capacity
@@ -188,7 +209,7 @@ def save_data()
     "charging_history": charging_history,
     "weekday_totals": weekday_totals
   }
-  
+
   try
     var f = open("battery_manager.json", "w")
     f.write(json.dump(data))
@@ -208,24 +229,24 @@ def log_charging_session(start_time, end_time, energy_used, eco_mode_active)
     "eco_mode_active": eco_mode_active,
     "date": tasmota.strftime("%Y-%m-%d", end_time)
   }
-  
+
   charging_history.push(session)
-  
+
   # Update weekday totals
   update_weekday_totals(session)
-  
+
   # Keep only last max_history_entries
   while charging_history.size() > max_history_entries
     charging_history.remove(0)
   end
-  
+
   save_data()
 end
 
 # Get energy data from Tasmota
 def get_energy_data()
   var energy_data = tasmota.cmd("Status 8")
-  
+
   if energy_data && energy_data.find("StatusSNS") && energy_data["StatusSNS"].find("ENERGY")
     return energy_data["StatusSNS"]["ENERGY"]
   end
@@ -242,12 +263,12 @@ def start_calibration(battery_percentage)
       start_battery_percentage = battery_percentage
       is_calibrating = true
       save_data()
-      
+
       log("Calibration started", 3)
       log("  Start energy: " + str(calibration_start_total) + " kWh", 3)
       log("  Start time: " + str(tasmota.time_str(calibration_start_time)), 3)
       log("  Battery level: " + str(battery_percentage) + "%", 3)
-      
+
       # Return status info in resp_cmnd
       return {
         "status": "started",
@@ -275,12 +296,12 @@ def end_calibration()
     var hours = duration_seconds / 3600
     var minutes = (duration_seconds % 3600) / 60
     var seconds = duration_seconds % 60
-    
+
     # Calculate total battery capacity
     var percentage_charged = 100 - start_battery_percentage
     var energy_per_percent = energy_used_kwh / percentage_charged
     total_battery_capacity = energy_per_percent * 100
-    
+
     log("Calibration ended", 3)
     log("  Start energy: " + str(calibration_start_total) + " kWh", 3)
     log("  End energy: " + str(end_total) + " kWh", 3)
@@ -289,20 +310,20 @@ def end_calibration()
     log("  End battery: 100%", 3)
     log("  Battery capacity: " + str(total_battery_capacity) + " kWh", 3)
     log("  Duration: " + string.format("%d:%02d:%02d", hours, minutes, seconds), 3)
-    
+
     # Reset calibration state
     var old_start = start_battery_percentage
     calibration_start_total = nil
     calibration_start_time = nil
     start_battery_percentage = nil
     is_calibrating = false
-    
+
     # Update eco state now that capacity is known
     update_eco_state()
-    
+
     # Save updated data
     save_data()
-    
+
     # Return status info
     return {
       "status": "completed",
@@ -315,7 +336,7 @@ def end_calibration()
     log("Error: Could not complete calibration", 2)
     return {"error": "Could not complete calibration"}
   end
-  
+
   return {"status": "error"}
 end
 
@@ -329,12 +350,12 @@ def start_charging()
     log("Charging session started", 3)
     log("  Start energy: " + str(charging_start_total) + " kWh", 3)
     log("  Start time: " + str(tasmota.time_str(charging_start_time)), 3)
-    
+
     var info = {
       "start_energy": charging_start_total,
       "start_time": charging_start_time
     }
-    
+
     if eco_state == "active"
       var weekday_avg = get_current_weekday_average()
       if weekday_avg
@@ -345,10 +366,10 @@ def start_charging()
         log("  Eco mode active but no weekday average available yet", 3)
       end
     end
-    
+
     return info
   end
-  
+
   return {"error": "Could not start charging"}
 end
 
@@ -357,16 +378,16 @@ def end_charging()
   if !is_charging
     return {"status": "not_charging"}
   end
-  
+
   var energy = get_energy_data()
   if energy && charging_start_total
     var end_total = energy["Total"]
     var energy_used_kwh = end_total - charging_start_total
     var end_time = tasmota.rtc()["local"]
-    
+
     log("Charging session ended", 3)
     log("  Energy used: " + str(energy_used_kwh) + " kWh", 3)
-    
+
     # Log session to history
     log_charging_session(
       charging_start_time,
@@ -374,12 +395,12 @@ def end_charging()
       energy_used_kwh,
       eco_state == "active"
     )
-    
+
     var old_start = charging_start_total
     charging_start_total = nil
     charging_start_time = nil
     is_charging = false
-    
+
     return {
       "status": "completed",
       "start_energy": old_start,
@@ -387,7 +408,7 @@ def end_charging()
       "energy_used": energy_used_kwh
     }
   end
-  
+
   return {"status": "error"}
 end
 
@@ -396,18 +417,18 @@ def check_energy_threshold()
   if eco_state != "active" || !is_charging || !charging_start_total
     return false
   end
-  
+
   var weekday_avg = get_current_weekday_average()
   if !weekday_avg
     return false
   end
-  
+
   var energy = get_energy_data()
   if energy
     var current_total = energy["Total"]
     var energy_used = current_total - charging_start_total
     var eco_threshold = weekday_avg * 0.7
-    
+
     if energy_used >= eco_threshold
       log("Eco mode threshold reached:", 3)
       log("  Energy used: " + str(energy_used) + " kWh", 3)
@@ -415,7 +436,7 @@ def check_energy_threshold()
       return true
     end
   end
-  
+
   return false
 end
 
@@ -447,7 +468,7 @@ end)
 # Monitor power state changes
 tasmota.add_rule("Power1#State", def (value)
   log("Power1 state changed to: " + str(value), 3)
-  
+
   if value == 1
     # Power turned ON
     if !is_charging
@@ -456,7 +477,7 @@ tasmota.add_rule("Power1#State", def (value)
   elif value == 0
     # Power turned OFF
     if is_charging
-      end_charging()         
+      end_charging()
       # If this was a calibration, end it
       if is_calibrating
         end_calibration()
@@ -474,7 +495,7 @@ def monitor_energy()
       log("Eco mode: stopping charge at 70% of weekday average", 3)
     end
   end
-  
+
   # Re-schedule the timer every 5 seconds
   tasmota.set_timer(5000, monitor_energy)
 end
@@ -482,11 +503,11 @@ end
 # Register StartCal command that accepts battery percentage
 tasmota.add_cmd("StartCal", def(cmd, idx, payload, payload_json)
   var percentage = nil
-  
+
   if payload
     percentage = number(payload)
   end
-  
+
   if percentage != nil
     var result = start_calibration(percentage)
     tasmota.resp_cmnd({"StartCal": result})
@@ -509,6 +530,7 @@ end)
 tasmota.add_cmd("EcoMode", def(cmd, idx, payload, payload_json)
   if payload
     if payload == "1" || string.tolower(payload) == "on" || string.tolower(payload) == "true"
+      reset_calibration_data()
       eco_mode_enabled = true
       update_eco_state()
       save_data()
@@ -532,15 +554,15 @@ end)
 # Register daily summary command
 tasmota.add_cmd("DailySummary", def(cmd, idx, payload, payload_json)
   summary_days = {}
-  
+
   for i: 0..charging_history.size()-1
     var session = charging_history[i]
     var date = session["date"]
-    
+
     if !summary_days.contains(date)
       summary_days[date] = {"total_energy": 0, "sessions": 0, "eco_sessions": 0, "total_duration": 0}
     end
-    
+
     summary_days[date]["total_energy"] += session["energy_used"]
     summary_days[date]["sessions"] += 1
     if session["eco_mode_active"]
@@ -548,7 +570,7 @@ tasmota.add_cmd("DailySummary", def(cmd, idx, payload, payload_json)
     end
     summary_days[date]["total_duration"] += session["duration"]
   end
-  
+
   tasmota.resp_cmnd({"DailySummary": summary_days})
 end)
 
@@ -558,17 +580,18 @@ tasmota.add_cmd("BatteryStatus", def(cmd, idx, payload, payload_json)
     "calibration_active": is_calibrating,
     "eco_mode": eco_mode_enabled,
     "eco_state": eco_state,
-    "charging": is_charging
+    "charging": is_charging,
+    "script_version": script_version
   }
-  
+
   if total_battery_capacity
     status["capacity"] = total_battery_capacity
   end
-  
+
   if is_calibrating
     status["battery_start"] = start_battery_percentage
   end
-  
+
   if is_charging && eco_state == "active"
     var weekday_avg = get_current_weekday_average()
     if weekday_avg
@@ -584,21 +607,26 @@ tasmota.add_cmd("BatteryStatus", def(cmd, idx, payload, payload_json)
       end
     end
   end
-  
+
   tasmota.resp_cmnd({"BatteryStatus": status})
+end)
+
+# Register script version command
+tasmota.add_cmd("ScriptVersion", def(cmd, idx, payload, payload_json)
+  tasmota.resp_cmnd({"ScriptVersion": {"version": script_version}})
 end)
 
 # Register WeekdayAverage command
 tasmota.add_cmd("WeekdayAverage", def(cmd, idx, payload, payload_json)
   var averages = {}
   var days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-  
+
   for day: days_order
     if weekday_totals.contains(day) && weekday_totals[day]["session_count"] > 0
       var total = weekday_totals[day]["total_energy"]
       var count = weekday_totals[day]["session_count"]
       var eco_count = weekday_totals[day]["eco_sessions"]
-      
+
       averages[day] = {
         "average_energy": total / count,
         "total_sessions": count,
@@ -614,7 +642,7 @@ tasmota.add_cmd("WeekdayAverage", def(cmd, idx, payload, payload_json)
       }
     end
   end
-  
+
   tasmota.resp_cmnd({"WeekdayAverage": averages})
 end)
 
@@ -630,35 +658,35 @@ def generate_test_data()
   var now = tasmota.rtc()["local"]
   charging_history = []
   init_weekday_totals()  # Reset weekday totals
-  
+
   # Generate 52 weeks of data (1 year)
   for week: 0..51
     for day: 0..6
       var day_offset = (week * 7) + day
       var day_ts = now - (day_offset * 86400)
       var day_date = tasmota.strftime("%Y-%m-%d", day_ts)
-      
+
       # 1-3 sessions per day
       var sessions_today = 1 + (math.rand() % 3)
-      
+
       for s: 0..sessions_today-1
         var dur = 1800 + ((math.rand() % 7200))  # 30min to 2.5hrs
         var end_t = day_ts - (s * 21600)
         var start_t = end_t - dur
-        
+
         # Weekday-specific energy patterns
         var weekday_num = tasmota.time_dump(day_ts)["weekday"]
         var base_energy = 0.4
-        
+
         # Higher usage on weekends
         if weekday_num == 0 || weekday_num == 6
           base_energy = 0.6
         end
-        
+
         var r_kwh = (math.rand() / 2147483647.0) * 0.3
         var energy_used = base_energy + r_kwh
         var eco_active = (math.rand() % 2) == 0
-        
+
         var session = {
           "start_time": start_t,
           "end_time": end_t,
@@ -667,18 +695,18 @@ def generate_test_data()
           "eco_mode_active": eco_active,
           "date": day_date
         }
-        
+
         charging_history.push(session)
         update_weekday_totals(session)
       end
     end
   end
-  
+
   # Trim to max entries if needed
   while charging_history.size() > max_history_entries
     charging_history.remove(0)
   end
-  
+
   log("Test data generated: " + str(charging_history.size()) + " sessions", 3)
   save_data()
   return {"status": "generated", "count": charging_history.size()}
