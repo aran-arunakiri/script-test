@@ -2,10 +2,10 @@
 provision_pi7.py — batch-flash a tray of factory AccuSavers from Tasmota to the
 modern (ESP-IDF) firmware, leaving every unit UNPROVISIONED and ready to ship.
 
-Relationship to provision_pi6.py
+Relationship to provision_pi8.py
 --------------------------------
-pi6 is the proven Tasmota -> Tasmota flow and is NOT copied here — it is
-imported, so every primitive (AP scanning, WiFi handling, Phase A, the LAN
+pi8 is the last confirmed-working Tasmota -> Tasmota flow and is NOT copied
+here — it is imported, so every primitive (AP scanning, WiFi handling, Phase A, the LAN
 sweep, Upgrade with retries) is literally the same code. pi7 only:
 
   * points OtaUrl at accusaver.bin instead of the Tasmota bin
@@ -27,7 +27,7 @@ provisioning advertising as ACCU_<last 6 hex of MAC>. That means:
 So Phase B collapses to "Upgrade 1, then confirm the unit left the LAN", and
 the real proof of success is Phase C: one BLE scan that sees every flashed unit
 advertising its ACCU_ name at once. One scan covers the whole tray, so we keep
-the throughput of pi6's parallel Phase B without needing a serial per-device
+the throughput of pi8's parallel Phase B without needing a serial per-device
 step.
 
 Usage
@@ -48,12 +48,13 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
-import provision_pi6 as p6
+import provision_pi8 as p8
 
 # -------- Configurable constants --------
 
 # The modern bin, served by nginx on this Pi (see setup_firmware_server.sh).
-# pi6's default pointed at 192.168.2.59, a subnet that no longer exists.
+# Overridable with --firmware-url: this address has changed with every
+# script generation (pi6: 192.168.2.59, pi8: 192.168.50.170).
 MODERN_FIRMWARE_URL = "http://192.168.0.88/accusaver.bin"
 
 # What we expect that bin to be. Checked once up front against version.txt
@@ -68,10 +69,18 @@ FLASH_TIMEOUT_SECONDS = 180
 
 # Phase A sends this as OtaUrl. Overriding the module global is the whole
 # "point it at the modern bin" change.
-p6.FIRMWARE_URL = MODERN_FIRMWARE_URL
+p8.FIRMWARE_URL = MODERN_FIRMWARE_URL
 
 
 # -------- Helpers --------
+
+# The firmware host's WAF blocks the default python-requests User-Agent
+# outright ("Request forbidden by administrative rules"), on HEAD and GET
+# alike. Identify ourselves honestly instead. Only the pre-flight talks to
+# that host; pi8's own calls go to the Pi and are left untouched.
+_http = requests.Session()
+_http.headers["User-Agent"] = "AccuSaver-provision/pi7"
+
 
 
 def ble_name_for_mac(mac: str) -> Optional[str]:
@@ -85,25 +94,31 @@ def ble_name_for_mac(mac: str) -> Optional[str]:
     return f"ACCU_{hexchars[-6:].upper()}"
 
 
-def check_firmware_served() -> bool:
+def check_firmware_served(url: str) -> bool:
     """
     Confirm the bin is reachable and is the version we think it is. A whole tray
     flashed with the wrong image is expensive to discover afterwards.
     """
+    # HEAD first; some hosts refuse HEAD (or refuse it for this User-Agent)
+    # while happily serving GET, so fall back to a streamed GET that reads the
+    # headers only and never downloads the bin.
     try:
-        head = requests.head(MODERN_FIRMWARE_URL, timeout=10)
+        resp = _http.head(url, timeout=10, allow_redirects=True)
+        if resp.status_code != 200:
+            resp = _http.get(url, timeout=10, stream=True)
+            resp.close()
     except Exception as e:
-        print(f"✗ Cannot reach {MODERN_FIRMWARE_URL}: {e}")
+        print(f"✗ Cannot reach {url}: {e}")
         return False
-    if head.status_code != 200:
-        print(f"✗ {MODERN_FIRMWARE_URL} -> HTTP {head.status_code}")
+    if resp.status_code != 200:
+        print(f"✗ {url} -> HTTP {resp.status_code}")
         return False
-    size = head.headers.get("content-length", "?")
+    size = resp.headers.get("content-length", "?")
     print(f"✓ Firmware reachable ({size} bytes)")
 
-    version_url = MODERN_FIRMWARE_URL.rsplit("/", 1)[0] + "/version.txt"
+    version_url = url.rsplit("/", 1)[0] + "/version.txt"
     try:
-        resp = requests.get(version_url, timeout=10)
+        resp = _http.get(version_url, timeout=10)
         if resp.status_code == 200:
             served = resp.text.strip().splitlines()[0].strip()
             if served == EXPECTED_MODERN_VERSION:
@@ -200,25 +215,25 @@ def flash_device_to_modern(
     start = time.time()
 
     if stagger_delay > 0:
-        p6.update_status(ip, f"⏳ Waiting {stagger_delay:.0f}s...")
+        p8.update_status(ip, f"⏳ Waiting {stagger_delay:.0f}s...")
         time.sleep(stagger_delay)
 
     if dry_run:
-        p6.update_status(ip, "✓ Dry run (no Upgrade sent)")
+        p8.update_status(ip, "✓ Dry run (no Upgrade sent)")
         return ip, True, time.time() - start
 
-    p6.update_status(ip, "📦 Sending upgrade...")
-    if not p6.send_upgrade(ip):
-        p6.update_status(ip, "✗ Upgrade failed")
+    p8.update_status(ip, "📦 Sending upgrade...")
+    if not p8.send_upgrade(ip):
+        p8.update_status(ip, "✗ Upgrade failed")
         return ip, False, time.time() - start
 
-    p6.update_status(ip, "🔄 Flashing (waiting for it to leave the LAN)...")
+    p8.update_status(ip, "🔄 Flashing (waiting for it to leave the LAN)...")
     if not wait_for_tasmota_gone(ip):
-        p6.update_status(ip, "✗ Still answering Tasmota — flash did not take")
+        p8.update_status(ip, "✗ Still answering Tasmota — flash did not take")
         return ip, False, time.time() - start
 
     elapsed = time.time() - start
-    p6.update_status(ip, f"✓ Off LAN ({elapsed:.0f}s) — pending BLE check")
+    p8.update_status(ip, f"✓ Off LAN ({elapsed:.0f}s) — pending BLE check")
     return ip, True, elapsed
 
 
@@ -230,7 +245,7 @@ def run_phase_a(expected_devices: int) -> int:
     Unchanged from pi6 apart from the bin it points at: a factory unit is still
     Tasmota, still has an AP, and we still need it on WiFi to reach it.
     """
-    config = p6.load_config()
+    config = p8.load_config()
     router_ssid = config["ssid"]
     router_password = config["password"]
 
@@ -244,25 +259,25 @@ def run_phase_a(expected_devices: int) -> int:
 
         connected_bssid = None
         while connected_bssid is None:
-            connected_bssid = p6.connect_wifi_to_ap(exclude_bssids=provisioned_bssids)
+            connected_bssid = p8.connect_wifi_to_ap(exclude_bssids=provisioned_bssids)
             if connected_bssid is None:
                 print("✗ Could not connect to AP, retrying in 3 seconds...")
                 time.sleep(3)
 
-        if not p6.ensure_ap_http():
+        if not p8.ensure_ap_http():
             print("✗ AP unreachable, skipping this device...\n")
             continue
 
-        if not p6.send_phase1_commands(router_ssid, router_password):
+        if not p8.send_phase1_commands(router_ssid, router_password):
             print("✗ Phase 1 failed, skipping this device...\n")
             continue
 
-        ip = p6.get_current_ip(p6.WIFI_INTERFACE)
+        ip = p8.get_current_ip(p8.WIFI_INTERFACE)
         if ip and ip.startswith("192.168.4."):
             provisioned_bssids.append(connected_bssid)
 
         time.sleep(2)
-        p6.disconnect_wifi()
+        p8.disconnect_wifi()
         provisioned += 1
         print(f"✓ PHASE A: {provisioned}/{expected_devices} AP-provisioned\n")
 
@@ -274,9 +289,9 @@ def discover_devices(explicit_ips: Optional[List[str]]) -> Dict[str, str]:
     if explicit_ips:
         ips = explicit_ips
     else:
-        prefix = p6.detect_lan_prefix(p6.LAN_INTERFACE)
-        found = p6.find_all_devices_by_scan(
-            prefix, p6.SCAN_START_HOST, p6.SCAN_END_HOST
+        prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
+        found = p8.find_all_devices_by_scan(
+            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST
         )
         ips = sorted(found.keys())
 
@@ -300,8 +315,12 @@ def main() -> int:
     parser.add_argument("--ble-only", action="store_true", help="only run the BLE scan")
     parser.add_argument("--dry-run", action="store_true", help="never send Upgrade")
     parser.add_argument("--ips", nargs="*", help="target these IPs instead of scanning")
+    # pi8 ships EXPECTED_DEVICES = 3, which is a test-batch value; a production
+    # tray is 18. Keep the real number as the default rather than inheriting it.
+    parser.add_argument("--expected", type=int, default=18, help="tray size")
     parser.add_argument(
-        "--expected", type=int, default=p6.EXPECTED_DEVICES, help="tray size"
+        "--firmware-url", default=MODERN_FIRMWARE_URL,
+        help="where the modern bin is served (version.txt is looked up next to it)",
     )
     parser.add_argument("--ble-seconds", type=int, default=BLE_SCAN_SECONDS)
     args = parser.parse_args()
@@ -310,17 +329,20 @@ def main() -> int:
         scan_ble_accusavers(args.ble_seconds)
         return 0
 
+    firmware_url = args.firmware_url
+    p8.FIRMWARE_URL = firmware_url  # Phase A sends this as OtaUrl
+
     print("=== TASMOTA -> MODERN BATCH MIGRATION ===\n")
-    print(f"Firmware : {MODERN_FIRMWARE_URL}")
+    print(f"Firmware : {firmware_url}")
     print(f"Expected : {EXPECTED_MODERN_VERSION}")
     print(f"Tray size: {args.expected}\n")
 
-    if not check_firmware_served():
+    if not check_firmware_served(firmware_url):
         print("\n✗ Pre-flight failed — not flashing anything.")
         return 1
 
     if not args.lan_only:
-        detected = p6.scan_accusaver_aps()
+        detected = p8.scan_accusaver_aps()
         if len(detected) != args.expected:
             print(f"\n✗ AP count mismatch: saw {len(detected)}, expected {args.expected}")
             return 1
@@ -341,7 +363,7 @@ def main() -> int:
     with ThreadPoolExecutor(max_workers=len(devices)) as executor:
         futures = {
             executor.submit(
-                flash_device_to_modern, ip, i * p6.STAGGER_DELAY, args.dry_run
+                flash_device_to_modern, ip, i * p8.STAGGER_DELAY, args.dry_run
             ): ip
             for i, ip in enumerate(sorted(devices))
         }
