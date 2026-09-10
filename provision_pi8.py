@@ -1,4 +1,5 @@
 import json
+import ast
 import subprocess
 import time
 import threading
@@ -16,8 +17,8 @@ TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"
 TASMOTA_HOSTNAME = "accusaver-3FCAD739"
 
-EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
-EXPECTED_SCRIPT_VERSION = "1.0.0"
+EXPECTED_FIRMWARE_DATE = "2026-01-10T12:48:26"
+EXPECTED_SCRIPT_VERSION = "2.1"
 
 WIFI_INTERFACE = "wlan0"
 LAN_INTERFACE = "eth0"
@@ -27,7 +28,7 @@ SCAN_END_HOST = 254
 
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-EXPECTED_DEVICES = 9
+EXPECTED_DEVICES = 3
 
 # Stagger delay between each device starting LAN provisioning (seconds)
 STAGGER_DELAY = 1.0
@@ -36,6 +37,10 @@ STAGGER_DELAY = 1.0
 # True  = old behaviour (skip provisioned BSSIDs)
 # False = allow reusing APs even if their BSSID is in provisioned_bssids
 AP_EXCLUSION_ENABLED = False
+
+# If True  → only APs whose SSID matches TASMOTA_AP_SSID exactly are used
+# If False → any SSID starting with "accusaver" is used (old behaviour)
+STRICT_SSID_MATCH = True
 
 # -------- Progress tracking --------
 progress_lock = threading.Lock()
@@ -50,8 +55,8 @@ def update_status(ip: str, status: str):
 
 
 def print_progress():
-    """Print a one-line progress summary."""
-    # FIX: count any status starting with ✓ / ✗, not just exact "✓ Complete"
+    """Print a one-line progress summary + per-device lines."""
+    # Count any status starting with ✓ / ✗
     complete = sum(1 for s in device_status.values() if s.startswith("✓"))
     failed = sum(1 for s in device_status.values() if s.startswith("✗"))
     in_progress = len(device_status) - complete - failed
@@ -101,7 +106,43 @@ def detect_lan_prefix(interface: str) -> str:
             return prefix
     raise RuntimeError(f"Could not detect LAN prefix on {interface}")
 
+def parse_tasmota_payload(resp: requests.Response):
+    """
+    Parse Tasmota response robustly:
+    - valid JSON
+    - Python-literal-like dict strings with single quotes
+    - plain text fallback
+    """
+    text = resp.text.strip()
 
+    try:
+        return resp.json()
+    except Exception:
+        pass
+
+    try:
+        return ast.literal_eval(text)
+    except Exception:
+        pass
+
+    return text
+
+
+def extract_script_version(payload) -> str:
+    """
+    Supports:
+      {"ScriptVersion":"2.1"}
+      {"ScriptVersion":{"version":"2.1"}}
+      {'ScriptVersion': {'version': '2.1'}}
+      "2.1"
+    """
+    if isinstance(payload, dict):
+        sv = payload.get("ScriptVersion", "")
+        if isinstance(sv, dict):
+            return str(sv.get("version", "")).strip()
+        return str(sv).strip()
+
+    return str(payload).strip()
 # -------- Wi-Fi / AP handling (Pi / Linux) --------
 
 
@@ -111,8 +152,16 @@ def disconnect_wifi():
 
 
 def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
-    """Parse nmcli wifi scan output into list of dicts with SSID, BSSID, CHAN, SIGNAL."""
-    results = []
+    """
+    Parse nmcli wifi scan output into list of dicts with SSID, BSSID, CHAN, SIGNAL.
+
+    Behaviour:
+      - If STRICT_SSID_MATCH is True:
+          only include APs whose SSID matches TASMOTA_AP_SSID (case-insensitive)
+      - If STRICT_SSID_MATCH is False:
+          include any SSID starting with "accusaver" (case-insensitive)
+    """
+    results: List[Dict[str, str]] = []
     lines = scan_output.strip().splitlines()
     if not lines:
         return results
@@ -122,23 +171,38 @@ def parse_wifi_scan(scan_output: str) -> List[Dict[str, str]]:
         # Format: "SSID                BSSID              CHAN  SIGNAL"
         # Fields are separated by whitespace, but SSID might have spaces
         parts = line.split()
-        if len(parts) >= 4:
-            # Last 3 parts are BSSID, CHAN, SIGNAL
-            # Everything before is SSID
-            signal = parts[-1]
-            chan = parts[-2]
-            bssid = parts[-3]
-            ssid = " ".join(parts[:-3])
+        if len(parts) < 4:
+            continue
 
-            if ssid.lower().startswith("accusaver"):
-                results.append(
-                    {
-                        "ssid": ssid,
-                        "bssid": bssid,
-                        "chan": chan,
-                        "signal": signal,
-                    }
-                )
+        # Last 3 parts are BSSID, CHAN, SIGNAL; everything before is SSID
+        signal = parts[-1]
+        chan = parts[-2]
+        bssid = parts[-3]
+        ssid = " ".join(parts[:-3]).strip()
+
+        if not ssid:
+            continue
+
+        ssid_l = ssid.lower()
+        target_l = TASMOTA_AP_SSID.lower()
+
+        include = False
+        if STRICT_SSID_MATCH:
+            if ssid_l == target_l:
+                include = True
+        else:
+            if ssid_l.startswith("accusaver"):
+                include = True
+
+        if include:
+            results.append(
+                {
+                    "ssid": ssid,
+                    "bssid": bssid,
+                    "chan": chan,
+                    "signal": signal,
+                }
+            )
 
     return results
 
@@ -501,26 +565,62 @@ def wait_for_script_after_safeboot(
                 timeout=5,
             )
             if resp.status_code == 200:
-                data = resp.json()
-                version = str(data.get("ScriptVersion", "")).strip()
+                data = parse_tasmota_payload(resp)
+                version = extract_script_version(data)
+                print(
+                    f"[{ip}] wait_for_script_after_safeboot attempt "
+                    f"{attempt}/{max_attempts}: version={version!r}, raw={resp.text!r}"
+                )
                 if version == expected_version:
                     return True
-        except Exception:
-            pass
+            else:
+                print(
+                    f"[{ip}] wait_for_script_after_safeboot attempt "
+                    f"{attempt}/{max_attempts}: HTTP {resp.status_code}, raw={resp.text!r}"
+                )
+        except Exception as e:
+            print(
+                f"[{ip}] wait_for_script_after_safeboot attempt "
+                f"{attempt}/{max_attempts} raised: {e}"
+            )
         time.sleep(delay_seconds)
 
     return False
 
-
 # -------- Resets and online wait --------
+def send_reset4(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
+    """
+    Send Reset 4 (soft reboot) with retries.
+    2026 02 24 sebastiaan reset 4 naar reset 1 gezet
+    Similar semantics to send_reset1:
+      * HTTP 200 = success
+      * Timeout / connection drop = very likely success (reboot in progress)
+      * Only repeated unexpected errors count as failure
 
+    The *real* check that the device is back online is done by
+    wait_for_device_online() afterwards.
+    """
+    url = f"http://{ip}/cm"
+    params = {"cmnd": "Reset 4"}
 
-def send_reset4(ip: str) -> bool:
-    try:
-        requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 4"}, timeout=5)
-        return True
-    except Exception:
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout_s)
+            if resp.status_code == 200:
+                return True
+        except Timeout:
+            # device probably rebooting mid-response -> treat as success
+            return True
+        except ConnectionError:
+            # connection dropped, also consistent with immediate reboot
+            return True
+        except Exception as e:
+            print(f"  ✗ Reset 4 error on {ip} (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            time.sleep(1.0)
+
+    return False
 
 
 def send_reset1(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
@@ -574,6 +674,7 @@ def wait_for_device_online(
 
 
 # -------- Verification --------
+
 
 def verify_firmware(
     ip: str,
@@ -651,7 +752,7 @@ def verify_script(
 ) -> bool:
     """
     Verify Berry script version via ScriptVersion with retries.
-    Logs detailed reasons on failure.
+    Handles both flat and nested ScriptVersion payloads.
     """
     last_reason = "unknown"
 
@@ -666,34 +767,27 @@ def verify_script(
                 last_reason = f"HTTP {resp.status_code}"
                 print(
                     f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
-                    f"HTTP {resp.status_code}"
+                    f"HTTP {resp.status_code}, raw={resp.text!r}"
                 )
             else:
-                try:
-                    data = resp.json()
-                except Exception as e:
-                    last_reason = f"JSON parse error: {e}"
+                data = parse_tasmota_payload(resp)
+                version = extract_script_version(data)
+
+                if version == EXPECTED_SCRIPT_VERSION:
+                    print(
+                        f"[{ip}] verify_script OK on attempt {attempt}: "
+                        f"{version!r}"
+                    )
+                    return True
+                else:
+                    last_reason = (
+                        f"ScriptVersion mismatch: got {version!r}, "
+                        f"expected {EXPECTED_SCRIPT_VERSION!r}, raw={resp.text!r}"
+                    )
                     print(
                         f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
-                        f"JSON parse error: {e}"
+                        f"{last_reason}"
                     )
-                else:
-                    version = str(data.get("ScriptVersion", "")).strip()
-                    if version == EXPECTED_SCRIPT_VERSION:
-                        print(
-                            f"[{ip}] verify_script OK on attempt {attempt}: "
-                            f"{version}"
-                        )
-                        return True
-                    else:
-                        last_reason = (
-                            f"ScriptVersion mismatch: got {version!r}, "
-                            f"expected {EXPECTED_SCRIPT_VERSION!r}"
-                        )
-                        print(
-                            f"[{ip}] verify_script attempt {attempt}/{max_attempts}: "
-                            f"{last_reason}"
-                        )
         except Exception as e:
             last_reason = f"Exception: {e}"
             print(
@@ -709,7 +803,6 @@ def verify_script(
         f"Last reason: {last_reason}"
     )
     return False
-
 
 # -------- Phase B per-device worker (LAN) --------
 
@@ -959,7 +1052,7 @@ if __name__ == "__main__":
     print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
-    with ThreadPoolExecutor(max_workers=min(len(devices_found), 16)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(devices_found), 32)) as executor:
         future_map = {}
         for idx, ip in enumerate(devices_found.keys()):
             stagger = idx * STAGGER_DELAY

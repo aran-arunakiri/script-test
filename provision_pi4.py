@@ -9,8 +9,8 @@ from requests.exceptions import ReadTimeout, ConnectionError, Timeout
 
 
 # -------- Configurable constants --------
-FIRMWARE_URL = "https://github.com/aran-arunakiri/script-test/raw/refs/heads/main/tasmota32c2-withfs.bin"
-BERRY_SCRIPT_URL = "https://raw.githubusercontent.com/aran-arunakiri/script-test/refs/heads/main/autoexec.be"
+FIRMWARE_URL = "http://192.168.2.59/tasmota32c2-withfs.bin"
+BERRY_SCRIPT_URL = "http://192.168.2.59/autoexec.be"
 
 TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"

@@ -9,15 +9,15 @@ from requests.exceptions import ReadTimeout, ConnectionError, Timeout
 
 
 # -------- Configurable constants --------
-FIRMWARE_URL = "http://192.168.2.59/tasmota32c2-withfs.bin"
-BERRY_SCRIPT_URL = "http://192.168.2.59/autoexec.be"
+FIRMWARE_URL = "http://192.168.50.170/tasmota32c2-withfs.bin"
+BERRY_SCRIPT_URL = "http://192.168.50.170/autoexec.be"
 
 TASMOTA_AP_SSID = "accusaver-3FCAD739"
 TASMOTA_AP_IP = "192.168.4.1"
 TASMOTA_HOSTNAME = "accusaver-3FCAD739"
 
-EXPECTED_FIRMWARE_DATE = "2025-12-04T13:37:42"
-EXPECTED_SCRIPT_VERSION = "1.0.0"
+EXPECTED_FIRMWARE_DATE = "2026-01-10T12:48:26"
+EXPECTED_SCRIPT_VERSION = "2.1"
 
 WIFI_INTERFACE = "wlan0"
 LAN_INTERFACE = "eth0"
@@ -27,7 +27,7 @@ SCAN_END_HOST = 254
 
 IP_DISCOVERY_ORDER: List[str] = ["scan"]
 
-EXPECTED_DEVICES = 18
+EXPECTED_DEVICES = 8
 
 # Stagger delay between each device starting LAN provisioning (seconds)
 STAGGER_DELAY = 1.0
@@ -540,14 +540,39 @@ def wait_for_script_after_safeboot(
 
 
 # -------- Resets and online wait --------
+def send_reset4(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
+    """
+    Send Reset 4 (soft reboot) with retries.
+    2026 02 24 sebastiaan reset 4 naar reset 1 gezet
+    Similar semantics to send_reset1:
+      * HTTP 200 = success
+      * Timeout / connection drop = very likely success (reboot in progress)
+      * Only repeated unexpected errors count as failure
 
+    The *real* check that the device is back online is done by
+    wait_for_device_online() afterwards.
+    """
+    url = f"http://{ip}/cm"
+    params = {"cmnd": "Reset 4"}
 
-def send_reset4(ip: str) -> bool:
-    try:
-        requests.get(f"http://{ip}/cm", params={"cmnd": "Reset 4"}, timeout=5)
-        return True
-    except Exception:
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params=params, timeout=timeout_s)
+            if resp.status_code == 200:
+                return True
+        except Timeout:
+            # device probably rebooting mid-response -> treat as success
+            return True
+        except ConnectionError:
+            # connection dropped, also consistent with immediate reboot
+            return True
+        except Exception as e:
+            print(f"  ✗ Reset 4 error on {ip} (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            time.sleep(1.0)
+
+    return False
 
 
 def send_reset1(ip: str, max_retries: int = 3, timeout_s: float = 5.0) -> bool:
@@ -601,6 +626,7 @@ def wait_for_device_online(
 
 
 # -------- Verification --------
+
 
 def verify_firmware(
     ip: str,
@@ -724,8 +750,7 @@ def verify_script(
         except Exception as e:
             last_reason = f"Exception: {e}"
             print(
-                f"[{ip}] verify_script attempt {attempt}/{max_attempts} "
-                f"raised: {e}"
+                f"[{ip}] verify_script attempt {attempt}/{max_attempts} " f"raised: {e}"
             )
 
         if attempt < max_attempts:
@@ -986,7 +1011,7 @@ if __name__ == "__main__":
     print_progress()
 
     # Use a thread pool to process devices in parallel with staggered starts
-    with ThreadPoolExecutor(max_workers=min(len(devices_found), 16)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(devices_found), 32)) as executor:
         future_map = {}
         for idx, ip in enumerate(devices_found.keys()):
             stagger = idx * STAGGER_DELAY
