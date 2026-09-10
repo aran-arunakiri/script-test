@@ -50,6 +50,10 @@ import requests
 
 import provision_pi8 as p8
 
+# Progress lines must reach a `tee`d log file as they happen, not in one burst
+# at exit: over ssh the whole run is otherwise invisible until it is over.
+sys.stdout.reconfigure(line_buffering=True)
+
 # -------- Configurable constants --------
 
 # The modern bin, served by nginx on this Pi (see setup_firmware_server.sh).
