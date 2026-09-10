@@ -1,12 +1,12 @@
 """
-provision_pi7.py — batch-flash a tray of factory AccuSavers from Tasmota to the
+provision_pi9.py — batch-flash a tray of factory AccuSavers from Tasmota to the
 modern (ESP-IDF) firmware, leaving every unit UNPROVISIONED and ready to ship.
 
 Relationship to provision_pi8.py
 --------------------------------
 pi8 is the last confirmed-working Tasmota -> Tasmota flow and is NOT copied
 here — it is imported, so every primitive (AP scanning, WiFi handling, Phase A, the LAN
-sweep, Upgrade with retries) is literally the same code. pi7 only:
+sweep, Upgrade with retries) is literally the same code. pi9 only:
 
   * points OtaUrl at accusaver.bin instead of the Tasmota bin
   * drops the steps that cannot survive the migration
@@ -32,11 +32,11 @@ step.
 
 Usage
 -----
-  python3 provision_pi7.py                 # full run: Phase A + B + C
-  python3 provision_pi7.py --lan-only      # skip Phase A (units already on WiFi)
-  python3 provision_pi7.py --lan-only --ips 192.168.0.61
-  python3 provision_pi7.py --ble-only      # just report which ACCU_ units advertise
-  python3 provision_pi7.py --dry-run       # everything except the actual Upgrade
+  python3 provision_pi9.py                 # full run: Phase A + B + C
+  python3 provision_pi9.py --lan-only      # skip Phase A (units already on WiFi)
+  python3 provision_pi9.py --lan-only --ips 192.168.0.61
+  python3 provision_pi9.py --ble-only      # just report which ACCU_ units advertise
+  python3 provision_pi9.py --dry-run       # everything except the actual Upgrade
 """
 
 import argparse
@@ -54,7 +54,8 @@ import provision_pi8 as p8
 
 # The modern bin, served by nginx on this Pi (see setup_firmware_server.sh).
 # Overridable with --firmware-url: this address has changed with every
-# script generation (pi6: 192.168.2.59, pi8: 192.168.50.170).
+# script generation (pi6: 192.168.2.59, pi8: 192.168.50.170); pass a port if
+# the bin is served by python -m http.server instead of nginx.
 MODERN_FIRMWARE_URL = "http://192.168.0.88/accusaver.bin"
 
 # What we expect that bin to be. Checked once up front against version.txt
@@ -79,7 +80,7 @@ p8.FIRMWARE_URL = MODERN_FIRMWARE_URL
 # alike. Identify ourselves honestly instead. Only the pre-flight talks to
 # that host; pi8's own calls go to the Pi and are left untouched.
 _http = requests.Session()
-_http.headers["User-Agent"] = "AccuSaver-provision/pi7"
+_http.headers["User-Agent"] = "AccuSaver-provision/pi9"
 
 
 
