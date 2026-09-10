@@ -188,9 +188,17 @@ def _clock() -> str:
     return f"{m}:{s_:02d}"
 
 
-def tally(letter: str, *parts: str) -> None:
+def bar(done: int, total: int, width: int = 20) -> str:
+    if total <= 0:
+        return ""
+    full = int(round(width * done / total))
+    return "[" + "█" * full + "░" * (width - full) + f"] {done}/{total}"
+
+
+def tally(letter: str, *parts: str, progress: Optional[Tuple[int, int]] = None) -> None:
     """One line that states the whole tray's position; repeated after every event."""
-    print(f"    ── {letter}  " + "  ·  ".join(parts) + f"  ·  {_clock()} in phase")
+    lead = f"    ── {letter}  " + (bar(*progress) + "  " if progress else "")
+    print(lead + "  ·  ".join(parts) + f"  ·  {_clock()} in phase")
 
 
 def _flash_tally() -> None:
@@ -199,7 +207,7 @@ def _flash_tally() -> None:
     done = sum(1 for x in st if x.startswith("✓"))
     bad = sum(1 for x in st if x.startswith("✗"))
     tally("B", f"upgrade sent {sent}/{len(_ip_names)}", f"off the LAN {done}/{len(_ip_names)}",
-          f"did not take {bad}")
+          f"did not take {bad}", progress=(done, len(_ip_names)))
 
 
 def _status_line(ip: str, status: str) -> None:
@@ -208,8 +216,9 @@ def _status_line(ip: str, status: str) -> None:
         return
     _last_status[ip] = status
     if status in ("setting OtaUrl", "flashing, waiting for it to leave the LAN"):
-        return  # intermediate; "upgrade sent" and "off the LAN" carry the story
-    plug_line(_ip_names.get(ip, ip), status, ip if ip in _ip_names else "")
+        return  # intermediate
+    if status != "upgrade sent":  # per-plug lines for off-the-LAN and failures only
+        plug_line(_ip_names.get(ip, ip), status, ip if ip in _ip_names else "")
     if _ip_names:
         _flash_tally()
 
@@ -726,7 +735,8 @@ def run_phase_a_pass(
             if tray:
                 tally("A", f"provisioned {provisioned_before + len(provisioned)}",
                       f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
-                      f"{len(candidates) - 1} AP(s) still visible")
+                      f"{len(candidates) - 1} AP(s) still visible",
+                      progress=(on_lan_count, len(tray)))
             continue
         visited.add(connected_bssid.upper())
 
@@ -744,7 +754,8 @@ def run_phase_a_pass(
         if tray:
             tally("A", f"provisioned {provisioned_before + len(provisioned)}",
                   f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
-                      f"{len(candidates) - 1} AP(s) still visible")
+                      f"{len(candidates) - 1} AP(s) still visible",
+                  progress=(on_lan_count, len(tray)))
 
     return provisioned
 
@@ -873,6 +884,7 @@ def main() -> int:
         args.firmware_url = default_firmware_url()
     disable_ap_autoconnect()
     p8.FIRMWARE_URL = args.firmware_url  # Phase A sends this as OtaUrl
+    p8.STAGGER_DELAY = 0.5  # 30 upgrades in 15 s instead of 30; nginx copes fine
 
     if args.ble_only:
         scan_ble_accusavers(args.ble_seconds)
@@ -959,7 +971,16 @@ def run_tray(args) -> int:
     Tasmota that was never a tray AP is never touched.
     """
     phase("PRE-FLIGHT")
-    aps = scan_tray_aps(fresh=True)
+    # One scan can miss a few of many APs on the same channel; take the
+    # union of up to three fresh scans (~10 s) before judging the tray.
+    seen: Dict[str, Dict[str, str]] = {}
+    for i in range(3):
+        for ap in scan_tray_aps(fresh=True):
+            seen.setdefault(ap["bssid"].upper(), ap)
+        if len(seen) >= args.expected and i >= 1:
+            break
+        time.sleep(3)
+    aps = list(seen.values())
     say(f"    {len(aps)} Tasmota access point(s) visible, {args.expected} expected")
     if args.survey:
         prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
@@ -1024,7 +1045,8 @@ def run_tray(args) -> int:
         have = {ap_bssid_for_mac(m) for m in on_lan.values()}
         still = set(tray) - have
         tally("A", f"on the LAN {len(have)}/{len(tray)}",
-              ("waiting for " + ", ".join(sorted(tray[b] for b in still))) if still else "all present")
+              ("waiting for " + ", ".join(sorted(tray[b] for b in still))) if still else "all present",
+              progress=(len(have), len(tray)))
         if still and not provisioned:
             time.sleep(JOIN_POLL_SECONDS)
 
@@ -1070,7 +1092,8 @@ def run_tray(args) -> int:
                 last_seen[b] = (f"full download logged by the Pi ({served[ip]} B) and left the LAN, "
                                 "but not seen over BLE — power it near the Pi and scan")
     tally("C", f"verified {len(verified)}/{len(tray)}",
-          ("missing " + ", ".join(sorted(tray[b] for b in set(tray) - verified))) if len(verified) < len(tray) else "all advertising")
+          ("missing " + ", ".join(sorted(tray[b] for b in set(tray) - verified))) if len(verified) < len(tray) else "all advertising",
+          progress=(len(verified), len(tray)))
 
     # ---- Report ----
     still_ap = {ap["bssid"].upper() for ap in scan_tray_aps(fresh=True)} if len(verified) < len(tray) else set()
