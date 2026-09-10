@@ -307,10 +307,10 @@ MAX_RUN_MINUTES_PER_PLUG = 1.0
 # After provisioning, wait this long before the first sweep; later sweeps
 # follow anyway until every plug is on the LAN, so this only sets the
 # earliest moment a fast joiner can be picked up.
-JOIN_WAIT_SECONDS = 10
+JOIN_WAIT_SECONDS = 5
 
 # While waiting for provisioned plugs to appear on the LAN, look again this often.
-JOIN_POLL_SECONDS = 10
+JOIN_POLL_SECONDS = 5
 
 # Reserve this much of the time box for flashing + verification; the rest is
 # for getting every plug onto the LAN.
