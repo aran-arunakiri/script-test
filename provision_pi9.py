@@ -143,8 +143,18 @@ def _status_line(ip: str, status: str) -> None:
         _flash_tally()
 
 
+_pi8_run_cmd = p8.run_cmd
+
+
+def _run_cmd_with_assoc_timeout(cmd):
+    if len(cmd) >= 4 and cmd[0] == "nmcli" and cmd[1:4] == ["device", "wifi", "connect"]:
+        cmd = ["nmcli", "-w", str(ASSOCIATION_TIMEOUT_S)] + list(cmd[1:])
+    return _pi8_run_cmd(cmd)
+
+
 p8.print = _pi8_filtered_print
 p8.update_status = _status_line
+p8.run_cmd = _run_cmd_with_assoc_timeout
 
 # -------- Configurable constants --------
 
@@ -177,6 +187,12 @@ JOIN_POLL_SECONDS = 10
 # Reserve this much of the time box for flashing + verification; the rest is
 # for getting every plug onto the LAN.
 FLASH_AND_VERIFY_MINUTES = 3
+
+# How long the Pi tries to associate with a plug's access point. A plug that
+# already holds credentials is mid-way onto the office WiFi and never lets us
+# in; NetworkManager would otherwise wait ~28 s per such plug. It turns up on
+# the LAN by itself, so give up early.
+ASSOCIATION_TIMEOUT_S = 12
 
 # LAN sweep parallelism. 254 hosts at a 3 s probe timeout take ~64 s with
 # pi8's 16 workers and ~16 s with 64; the probes themselves are unchanged.
@@ -254,6 +270,36 @@ def scan_tray_aps(fresh: bool) -> List[Dict[str, str]]:
             aps.append(ap)
     aps.sort(key=lambda a: int(a["signal"]), reverse=True)
     return aps
+
+
+def bin_downloads_since(t0: float, url: str) -> Dict[str, int]:
+    """
+    ip -> bytes served for the modern bin since t0, from the Pi's own nginx
+    access log. Evidence that a plug fetched the whole image even when it was
+    pulled before the BLE check. Empty when the log is not readable or the bin
+    is served by something else.
+    """
+    path = url.rsplit("/", 1)[-1]
+    out: Dict[str, int] = {}
+    try:
+        with open("/var/log/nginx/access.log") as f:
+            lines = f.readlines()[-5000:]
+    except Exception:
+        return out
+    import datetime
+    for line in lines:
+        if f"GET /{path} " not in line or '" 200 ' not in line:
+            continue
+        try:
+            ip = line.split(" ", 1)[0]
+            stamp = line.split("[", 1)[1].split("]", 1)[0]
+            when = datetime.datetime.strptime(stamp, "%d/%b/%Y:%H:%M:%S %z").timestamp()
+            size = int(line.split('" 200 ', 1)[1].split(" ", 1)[0])
+        except Exception:
+            continue
+        if when >= t0 - 5:
+            out[ip] = max(out.get(ip, 0), size)
+    return out
 
 
 def check_firmware_served(url: str) -> bool:
@@ -776,6 +822,13 @@ def run_tray(args) -> int:
         verified = {b for b in flashed if tray[b] in advertising}
     for b in verified:
         last_seen[b] = "verified over BLE"
+    if flashed - verified:
+        served = bin_downloads_since(t0, args.firmware_url)
+        for ip, mac in on_lan.items():
+            b = ap_bssid_for_mac(mac)
+            if b in flashed - verified and served.get(ip):
+                last_seen[b] = (f"full download logged by the Pi ({served[ip]} B) and left the LAN, "
+                                "but not seen over BLE — power it near the Pi and scan")
     tally("C", f"verified {len(verified)}/{len(tray)}",
           ("missing " + ", ".join(sorted(tray[b] for b in set(tray) - verified))) if len(verified) < len(tray) else "all advertising")
 
