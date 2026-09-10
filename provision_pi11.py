@@ -337,6 +337,11 @@ PING_TIMEOUT_S = 1
 # (normal is 2–4 s, outliers need more) and cost a retry round.
 ASSOCIATION_TIMEOUT_S = 10
 
+# On later attempts at the same plug (its AP came back after a missed WiFi
+# join) be patient: a plug in AP-fallback mode has needed >10 s to accept an
+# association, and giving up again just burns another round.
+ASSOCIATION_TIMEOUT_RETRY_S = 25
+
 # LAN sweep parallelism. 254 hosts at a 3 s probe timeout take ~64 s with
 # pi8's 16 workers and ~16 s with 64; the probes themselves are unchanged.
 SWEEP_WORKERS = 64
@@ -394,7 +399,7 @@ def sta_mac_for_bssid(bssid: str) -> str:
     return ":".join(h[i:i + 2] for i in range(0, 12, 2))
 
 
-def join_ap(ssid: str, bssid: str) -> Tuple[bool, str]:
+def join_ap(ssid: str, bssid: str, timeout_s: int = ASSOCIATION_TIMEOUT_S) -> Tuple[bool, str]:
     """
     Join one specific plug access point. Unlike pi8's connect this does not
     rescan first (the caller just listed the APs) and does not run a separate
@@ -404,7 +409,7 @@ def join_ap(ssid: str, bssid: str) -> Tuple[bool, str]:
     import subprocess
     p8.disconnect_wifi()
     subprocess.run(["ip", "addr", "flush", "dev", p8.WIFI_INTERFACE], capture_output=True)
-    cmd = ["nmcli", "-w", str(ASSOCIATION_TIMEOUT_S), "device", "wifi", "connect", ssid,
+    cmd = ["nmcli", "-w", str(timeout_s), "device", "wifi", "connect", ssid,
            "bssid", bssid, "ifname", p8.WIFI_INTERFACE]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 and "No network with SSID" in (r.stderr + r.stdout):
@@ -679,6 +684,7 @@ def run_phase_a_pass(
     tray_bssids: Set[str], skip_bssids: Set[str],
     tray: Optional[Dict[str, str]] = None, on_lan_count: int = 0,
     provisioned_before: int = 0, swept: bool = True,
+    attempts: Optional[Dict[str, int]] = None,
 ) -> List[str]:
     """
     One pass: push WiFi + OtaUrl into every currently visible AP that belongs
@@ -724,8 +730,13 @@ def run_phase_a_pass(
         name = ble_name_for_mac(sta_mac_for_bssid(target["bssid"])) or target["bssid"]
         t_plug = time.time()
 
+        key = target["bssid"].upper()
+        if attempts is not None:
+            attempts[key] = attempts.get(key, 0) + 1
+        patient = attempts is not None and attempts[key] > 1
         t_join = time.time()
-        joined, why = join_ap(target["ssid"], target["bssid"])
+        joined, why = join_ap(target["ssid"], target["bssid"],
+                              ASSOCIATION_TIMEOUT_RETRY_S if patient else ASSOCIATION_TIMEOUT_S)
         t_join = time.time() - t_join
         connected_bssid = target["bssid"] if joined else None
         if connected_bssid is None:
@@ -1021,6 +1032,7 @@ def run_tray(args) -> int:
     on_lan: Dict[str, str] = {}  # ip -> mac, tray members only
     provisioned_total = 0
     swept_once = False
+    join_attempts: Dict[str, int] = {}
     while True:
         have = {ap_bssid_for_mac(m) for m in on_lan.values()}
         missing = set(tray) - have
@@ -1031,7 +1043,7 @@ def run_tray(args) -> int:
             break
         provisioned = run_phase_a_pass(missing, skip_bssids=set(), tray=tray,
                                        on_lan_count=len(have), provisioned_before=provisioned_total,
-                                       swept=swept_once)
+                                       swept=swept_once, attempts=join_attempts)
         provisioned_total += len(provisioned)
         for b in provisioned:
             last_seen[b] = "provisioned, never joined the WiFi"
