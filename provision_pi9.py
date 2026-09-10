@@ -152,6 +152,22 @@ def get_device_mac(ip: str, timeout_s: float = 3.0) -> Optional[str]:
     return None
 
 
+def set_ota_url(ip: str, url: str, max_retries: int = 3) -> bool:
+    """Point the unit's OtaUrl at the modern bin and read it back to be sure."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(
+                f"http://{ip}/cm", params={"cmnd": f"OtaUrl {url}"}, timeout=8
+            )
+            if resp.status_code == 200 and resp.json().get("OtaUrl") == url:
+                return True
+        except Exception:
+            pass
+        if attempt < max_retries:
+            time.sleep(3)
+    return False
+
+
 def wait_for_tasmota_gone(
     ip: str, timeout_s: int = FLASH_TIMEOUT_SECONDS, poll_s: float = 5.0
 ) -> bool:
@@ -222,6 +238,16 @@ def flash_device_to_modern(
     if dry_run:
         p8.update_status(ip, "✓ Dry run (no Upgrade sent)")
         return ip, True, time.time() - start
+
+    # Phase A sets OtaUrl on the AP side, but a unit that was already on the
+    # LAN (--lan-only, or a plug that kept its WiFi creds from an earlier run)
+    # still carries whatever OtaUrl it had — typically the Tasmota bin from a
+    # pi8 run. Upgrade 1 flashes whatever OtaUrl says, so set it here every
+    # time; it is one cheap idempotent command.
+    p8.update_status(ip, "🔗 Setting OtaUrl...")
+    if not set_ota_url(ip, p8.FIRMWARE_URL):
+        p8.update_status(ip, "✗ Could not set OtaUrl")
+        return ip, False, time.time() - start
 
     p8.update_status(ip, "📦 Sending upgrade...")
     if not p8.send_upgrade(ip):
