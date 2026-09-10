@@ -208,7 +208,7 @@ def _flash_tally() -> None:
     bad = sum(1 for x in st if x.startswith("✗"))
     busy = max(0, sent - done - bad)
     tally("B", f"flashing {busy}", f"off the LAN {done}/{len(_ip_names)}",
-          f"did not take {bad}", progress=(done, len(_ip_names)))
+          f"mislukt {bad}", progress=(done, len(_ip_names)))
 
 
 def _status_line(ip: str, status: str) -> None:
