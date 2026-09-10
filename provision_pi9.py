@@ -746,7 +746,10 @@ def run_tray(args) -> int:
         say(f"    modern units in BLE range, not tray members: {sorted(modern_before) or '-'}")
     if len(aps) != args.expected:
         say(f"    ✗ TRAY MISMATCH: {len(aps)} visible, {args.expected} expected. Nothing touched.")
-        say("      Missing plugs: no power, out of WiFi range of the Pi, or not factory-fresh.")
+        if args.expected == EXPECTED_TRAY_SIZE:
+            say(f"      {EXPECTED_TRAY_SIZE} is the default tray size. For a different tray pass --expected N,")
+            say(f"      e.g.  --expected {len(aps)}  if all {len(aps)} plugs of this tray are powered.")
+        say("      Otherwise: missing plugs have no power, are out of WiFi range of the Pi, or are not factory-fresh.")
         say("      For a half-done tray use --lan-only --expected N.")
         return 1
 
