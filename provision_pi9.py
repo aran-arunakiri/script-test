@@ -658,12 +658,14 @@ def run_phase_a_pass(
         # exactly this AP by naming its SSID and excluding every other one.
         p8.TASMOTA_AP_SSID = target["ssid"]
         exclude = [ap["bssid"] for ap in visible if ap["bssid"] != target["bssid"]]
+        t_join = time.time()
         connected_bssid = p8.connect_wifi_to_ap(exclude_bssids=exclude)
+        t_join = time.time() - t_join
         if connected_bssid is None:
             # Count it as visited for this pass so one flaky AP cannot stall
             # the pass; a later pass gets another go at it.
             visited.add(target["bssid"].upper())
-            plug_line(name, "✗ could not join its access point", "retry later")
+            plug_line(name, "✗ could not join its access point", f"gave up after {t_join:.0f} s, retry later")
             if tray:
                 tally("A", f"provisioned {provisioned_before + len(provisioned)}",
                       f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
@@ -671,19 +673,24 @@ def run_phase_a_pass(
             continue
         visited.add(connected_bssid.upper())
 
+        t_contact = time.time()
         if not p8.ensure_ap_http():
             plug_line(name, "✗ joined but no HTTP answer", "retry later")
             p8.disconnect_wifi()
             continue
+        t_contact = time.time() - t_contact
 
+        t_cmd = time.time()
         if not p8.send_phase1_commands(router_ssid, router_password):
             plug_line(name, "✗ credentials not accepted", "retry later")
             p8.disconnect_wifi()
             continue
+        t_cmd = time.time() - t_cmd
 
         p8.disconnect_wifi()
         provisioned.append(connected_bssid.upper())
-        plug_line(name, "provisioned", f"{time.time() - t_plug:.0f} s")
+        plug_line(name, "provisioned",
+                  f"{time.time() - t_plug:.0f} s  (join {t_join:.0f} · contact {t_contact:.0f} · cmd {t_cmd:.0f})")
         if tray:
             tally("A", f"provisioned {provisioned_before + len(provisioned)}",
                   f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
