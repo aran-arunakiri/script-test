@@ -294,7 +294,7 @@ FLASH_AND_VERIFY_MINUTES = 3
 # the LAN by itself, so give up early — but not too early: on 2026-09-10 a
 # 12 s cap made two perfectly fresh plugs miss their first association
 # (normal is 2–4 s, outliers need more) and cost a retry round.
-ASSOCIATION_TIMEOUT_S = 20
+ASSOCIATION_TIMEOUT_S = 10
 
 # LAN sweep parallelism. 254 hosts at a 3 s probe timeout take ~64 s with
 # pi8's 16 workers and ~16 s with 64; the probes themselves are unchanged.
