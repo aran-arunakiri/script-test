@@ -746,7 +746,7 @@ def run_phase_a_pass(
             plug_line(name, "✗ could not join its access point", f"after {t_join:.0f} s: {why}; retry later")
             if tray:
                 tally("A",
-                      (f"on the LAN {on_lan_count}/{len(tray)}" if swept else f"provisioned {provisioned_before + len(provisioned)}"),
+                      (f"provisioned {provisioned_before + len(provisioned)}" if swept else f"on the LAN 0/{len(tray)} (not swept yet)"),
                       f"{len(candidates) - 1} AP(s) still visible",
                       progress=((on_lan_count, len(tray), "on the LAN") if swept else (provisioned_before + len(provisioned), len(tray), "provisioned")))
             continue
@@ -765,7 +765,7 @@ def run_phase_a_pass(
                   f"{time.time() - t_plug:.0f} s  (join {t_join:.0f} · cmd {t_cmd:.0f})")
         if tray:
             tally("A",
-                  (f"on the LAN {on_lan_count}/{len(tray)}" if swept else f"provisioned {provisioned_before + len(provisioned)}"),
+                  (f"provisioned {provisioned_before + len(provisioned)}" if swept else f"on the LAN 0/{len(tray)} (not swept yet)"),
                   f"{len(candidates) - 1} AP(s) still visible",
                   progress=((on_lan_count, len(tray), "on the LAN") if swept else (provisioned_before + len(provisioned), len(tray), "provisioned")))
 
