@@ -206,7 +206,8 @@ def _flash_tally() -> None:
     sent = sum(1 for x in st if x != "setting OtaUrl")
     done = sum(1 for x in st if x.startswith("✓"))
     bad = sum(1 for x in st if x.startswith("✗"))
-    tally("B", f"upgrade sent {sent}/{len(_ip_names)}", f"off the LAN {done}/{len(_ip_names)}",
+    busy = max(0, sent - done - bad)
+    tally("B", f"flashing {busy}", f"off the LAN {done}/{len(_ip_names)}",
           f"did not take {bad}", progress=(done, len(_ip_names)))
 
 
