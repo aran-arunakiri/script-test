@@ -107,6 +107,13 @@ def ble_name_for_mac(mac: str) -> Optional[str]:
     return f"ACCU_{hexchars[-6:].upper()}"
 
 
+def ap_bssid_for_mac(mac: str) -> str:
+    """ESP32 derives its soft-AP BSSID from the station MAC by adding one."""
+    n = int(mac.replace(":", "").replace("-", ""), 16) + 1
+    h = f"{n:012X}"
+    return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
 def check_firmware_served(url: str) -> bool:
     """
     Confirm the bin is reachable and is the version we think it is. A whole tray
@@ -292,7 +299,7 @@ def flash_device_to_modern(
 # -------- Phases --------
 
 
-def run_phase_a(expected_devices: Optional[int]) -> int:
+def run_phase_a(expected_devices: Optional[int]) -> Tuple[int, List[str]]:
     """
     Walk every AccuSaver access point we can see and push WiFi + OtaUrl into it.
 
@@ -361,11 +368,20 @@ def run_phase_a(expected_devices: Optional[int]) -> int:
         provisioned += 1
         print(f"✓ PHASE A: {provisioned}/{target} AP-provisioned ({connected_bssid})\n")
 
-    return provisioned
+    return provisioned, visited_bssids
 
 
-def discover_devices(explicit_ips: Optional[List[str]]) -> Dict[str, str]:
-    """Returns ip -> mac for every Tasmota AccuSaver we can see on the LAN."""
+def discover_devices(
+    explicit_ips: Optional[List[str]], only_bssids: Optional[List[str]] = None
+) -> Dict[str, str]:
+    """
+    Returns ip -> mac for every Tasmota AccuSaver we can see on the LAN.
+
+    With only_bssids (the APs Phase A provisioned in this run) anything else
+    on the LAN is listed and skipped: a stray Tasmota somewhere in the office
+    must not be flashed just because it answered a scan.
+    """
+    wanted = {b.upper() for b in only_bssids} if only_bssids else None
     if explicit_ips:
         ips = explicit_ips
     else:
@@ -379,7 +395,9 @@ def discover_devices(explicit_ips: Optional[List[str]]) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for ip in ips:
         mac = get_device_mac(ip)
-        if mac:
+        if mac and wanted is not None and ap_bssid_for_mac(mac) not in wanted:
+            print(f"  {ip}  mac={mac}  not provisioned by this run — skipping")
+        elif mac:
             result[ip] = mac
             print(f"  {ip}  mac={mac}  -> expects {ble_name_for_mac(mac)}")
         else:
@@ -433,34 +451,38 @@ def main() -> int:
         print("\n✗ Pre-flight failed — not flashing anything.")
         return 1
 
-    already_modern: Set[str] = set()
+    visited: Optional[List[str]] = None
     if not args.lan_only:
-        print("=== PRE-FLIGHT: accounting for every plug on the tray ===")
+        print("=== PRE-FLIGHT: a clean tray shows exactly one Tasmota AP per plug ===")
         p8.STRICT_SSID_MATCH = False
         aps = p8.scan_accusaver_aps()
         prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
         on_lan = p8.find_all_devices_by_scan(
             prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST, timeout_seconds=3.0
         )
-        already_modern = scan_ble_accusavers(args.ble_seconds)
-        total = len(aps) + len(on_lan) + len(already_modern)
-        print(f"\n  Tasmota access points : {len(aps)}")
-        print(f"  Tasmota on the LAN    : {len(on_lan)}  {sorted(on_lan) or ''}")
-        print(f"  Already modern (BLE)  : {len(already_modern)}  {sorted(already_modern) or ''}")
-        print(f"  Total accounted for   : {total}  (expected {args.expected})")
-        if total != args.expected:
-            print(f"\n✗ Tray mismatch: {total} plug(s) accounted for, expected {args.expected}. "
-                  "Not touching anything. Check power/range of the missing ones, "
-                  "or pass --expected if the tray really is a different size.")
+        modern = scan_ble_accusavers(args.ble_seconds)
+        if on_lan:
+            print(f"\n⚠️  Tasmota already on the LAN (not counted): {sorted(on_lan)}")
+        if modern:
+            print(f"⚠️  Modern units in BLE range (not counted): {sorted(modern)}")
+        if on_lan or modern:
+            print("   If any of these are on the tray, the tray is not clean: "
+                  "the factory must deliver unprovisioned Tasmota only.")
+        if len(aps) != args.expected:
+            print(f"\n✗ Tray mismatch: {len(aps)} Tasmota AP(s) visible, expected "
+                  f"{args.expected}. Not touching anything.")
+            print("   Missing plugs: no power, out of WiFi range of the Pi, or not "
+                  "factory-fresh (see warnings above). For a half-done tray use "
+                  "--lan-only --expected N.")
             return 1
-        print("\n✓ Pre-flight: tray fully accounted for\n")
-        done = run_phase_a(None)
-        print(f"\nPhase A provisioned {done} AP(s)")
+        print(f"\n✓ Pre-flight: {len(aps)} AccuSaver AP(s), tray is clean\n")
+        done, visited = run_phase_a(None)
+        print(f"\nPhase A provisioned {done}/{args.expected} AP(s)")
         print("Waiting 20s for devices to join WiFi...")
         time.sleep(20)
 
     print("\n=== DISCOVERY: finding units on the LAN ===")
-    devices = discover_devices(args.ips)
+    devices = discover_devices(args.ips, only_bssids=visited)
     if not devices:
         print("✗ No devices found on the LAN.")
         return 1
@@ -507,10 +529,8 @@ def main() -> int:
         print(f"\n  note: {len(unexpected)} other AccuSaver(s) in BLE range: "
               f"{sorted(unexpected)}")
 
-    shipped = ok_count + len(already_modern)
-    print(f"\n{ok_count}/{len(devices)} flashed unit(s) verified"
-          + (f", plus {len(already_modern)} already modern" if already_modern else "")
-          + f" = {shipped}/{args.expected} ready to ship.")
+    shipped = ok_count
+    print(f"\n{shipped}/{args.expected} unit(s) ready to ship.")
     if shipped != args.expected:
         failed = [f"{ip} ({ble_name_for_mac(devices[ip])})" for ip in sorted(devices)
                   if not (results.get(ip) and ble_name_for_mac(devices[ip]) in advertising)]
