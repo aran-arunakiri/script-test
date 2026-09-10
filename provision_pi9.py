@@ -56,11 +56,31 @@ sys.stdout.reconfigure(line_buffering=True)
 
 
 class _Stamped:
-    """Prefix every line with a wall-clock time so a log can be timed later."""
+    """
+    Prefix every line with a wall-clock time, and copy everything to a log
+    file when one is open — so a run can be followed with `tail -f` from
+    elsewhere no matter how it was started.
+    """
 
     def __init__(self, raw):
         self._raw = raw
         self._at_line_start = True
+        self._log = None
+
+    def open_log(self, path: str) -> None:
+        self.close_log()
+        try:
+            self._log = open(path, "a", buffering=1)
+        except Exception:
+            self._log = None
+
+    def close_log(self) -> None:
+        if self._log:
+            try:
+                self._log.close()
+            except Exception:
+                pass
+        self._log = None
 
     def write(self, text):
         out = []
@@ -70,10 +90,21 @@ class _Stamped:
             else:
                 out.append(chunk)
             self._at_line_start = chunk.endswith("\n")
-        self._raw.write("".join(out))
+        joined = "".join(out)
+        self._raw.write(joined)
+        if self._log:
+            try:
+                self._log.write(joined)
+            except Exception:
+                pass
 
     def flush(self):
         self._raw.flush()
+        if self._log:
+            try:
+                self._log.flush()
+            except Exception:
+                pass
 
     def __getattr__(self, name):
         return getattr(self._raw, name)
@@ -94,6 +125,41 @@ def _pi8_filtered_print(*a, **k):
 
 def say(msg: str) -> None:
     print(msg)
+
+
+def banner(lines: List[str]) -> None:
+    """A box the operator cannot miss."""
+    width = max(len(l) for l in lines) + 6
+    print("")
+    print("#" * width)
+    for l in lines:
+        print("#  " + l.ljust(width - 6) + "  #")
+    print("#" * width)
+    print("")
+
+
+def ask_tray_size(default: Optional[int]) -> int:
+    """Operator prompt, Dutch, Enter keeps the default."""
+    while True:
+        hint = f" [{default}]" if default else ""
+        try:
+            raw = input(f"Hoeveel stekkers liggen er op de tray?{hint}: ").strip()
+        except EOFError:
+            return default or EXPECTED_TRAY_SIZE
+        if not raw and default:
+            return default
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        print("  Typ een getal, bijvoorbeeld 6.")
+
+
+def ask_next_tray() -> bool:
+    """Returns False when the operator wants to stop."""
+    try:
+        raw = input("Volgende tray klaar?  Druk op Enter om te starten, of typ  q  om te stoppen: ").strip().lower()
+    except EOFError:
+        return False
+    return not raw.startswith("q")
 
 
 def phase(name: str, detail: str = "") -> None:
@@ -162,7 +228,36 @@ p8.run_cmd = _run_cmd_with_assoc_timeout
 # Overridable with --firmware-url: this address has changed with every
 # script generation (pi6: 192.168.2.59, pi8: 192.168.50.170); pass a port if
 # the bin is served by python -m http.server instead of nginx.
-MODERN_FIRMWARE_URL = "http://192.168.0.88/accusaver.bin"
+MODERN_FIRMWARE_URL = "http://192.168.0.88/accusaver.bin"  # fallback only
+
+
+def default_firmware_url() -> str:
+    """The bin served by this Pi's own nginx, addressed by the Pi's LAN IP."""
+    try:
+        import subprocess
+        out = subprocess.run(["ip", "-4", "addr", "show", "eth0"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("inet "):
+                return f"http://{line.split()[1].split('/')[0]}/accusaver.bin"
+    except Exception:
+        pass
+    return MODERN_FIRMWARE_URL
+
+
+def log_dir() -> str:
+    """~/pi9-logs of the person who ran sudo, so `tail -f` works from their account."""
+    import os
+    user = os.environ.get("SUDO_USER") or os.environ.get("USER") or ""
+    home = f"/home/{user}" if user and user != "root" else os.path.expanduser("~")
+    d = os.path.join(home, "pi9-logs")
+    try:
+        os.makedirs(d, exist_ok=True)
+        if os.environ.get("SUDO_UID"):
+            os.chown(d, int(os.environ["SUDO_UID"]), int(os.environ.get("SUDO_GID", os.environ["SUDO_UID"])))
+    except Exception:
+        pass
+    return d
 
 # What we expect that bin to be. Checked once up front against version.txt
 # sitting next to it, because once a unit is flashed it is off the network and
@@ -641,14 +736,15 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="never send Upgrade")
     parser.add_argument("--ips", nargs="*", help="(--lan-only) target these IPs")
     parser.add_argument(
-        "--expected", type=int, default=EXPECTED_TRAY_SIZE,
+        "--expected", type=int, default=None,
         help="tray size; pre-flight refuses to start unless exactly this many "
              "Tasmota APs are visible, and the run only succeeds with exactly "
-             "this many verified over BLE",
+             "this many verified over BLE. Asked interactively when omitted "
+             f"(default {EXPECTED_TRAY_SIZE} when not interactive)",
     )
     parser.add_argument(
-        "--firmware-url", default=MODERN_FIRMWARE_URL,
-        help="where the modern bin is served (version.txt is looked up next to it)",
+        "--firmware-url", default=None,
+        help="where the modern bin is served (default: this Pi's own nginx)",
     )
     parser.add_argument("--ble-seconds", type=int, default=BLE_SCAN_SECONDS)
     parser.add_argument("--verbose", action="store_true",
@@ -659,30 +755,52 @@ def main() -> int:
     parser.add_argument("--max-minutes", type=int, default=None,
                         help="give up converging on the tray after this long "
                              "(default: 10 + 1 per plug)")
+    parser.add_argument("--once", action="store_true",
+                        help="run one tray and exit even from a terminal")
     args = parser.parse_args()
-    if args.max_minutes is None:
-        args.max_minutes = int(MAX_RUN_MINUTES_BASE + MAX_RUN_MINUTES_PER_PLUG * args.expected)
+
+    global VERBOSE
+    VERBOSE = args.verbose
+    p8.STRICT_SSID_MATCH = False
+    if args.firmware_url is None:
+        args.firmware_url = default_firmware_url()
+    p8.FIRMWARE_URL = args.firmware_url  # Phase A sends this as OtaUrl
 
     if args.ble_only:
         scan_ble_accusavers(args.ble_seconds)
         return 0
 
-    global VERBOSE
-    VERBOSE = args.verbose
-    p8.FIRMWARE_URL = args.firmware_url  # Phase A sends this as OtaUrl
-    p8.STRICT_SSID_MATCH = False
+    interactive = sys.stdin.isatty() and not args.once and not args.lan_only
+    tray_size = args.expected
+    while True:
+        if tray_size is None:
+            tray_size = ask_tray_size(None) if interactive else EXPECTED_TRAY_SIZE
+        elif interactive and args.expected is None:
+            tray_size = ask_tray_size(tray_size)
+        args.expected = tray_size
+        args.max_minutes = int(MAX_RUN_MINUTES_BASE + MAX_RUN_MINUTES_PER_PLUG * tray_size) \
+            if "--max-minutes" not in sys.argv else args.max_minutes
 
-    say("AccuSaver tray migration: Tasmota -> modern firmware")
-    say(f"  tray       {args.expected} plug(s) expected")
-    say(f"  time box   {args.max_minutes} min")
-    if not check_firmware_served(args.firmware_url):
-        say("  ✗ firmware not served correctly, not flashing anything")
-        return 1
+        log_path = f"{log_dir()}/tray-{time.strftime('%Y-%m-%d-%H%M%S')}.log"
+        sys.stdout.open_log(log_path)
+        say("AccuSaver tray migration: Tasmota -> modern firmware")
+        say(f"  tray       {args.expected} plug(s) expected")
+        say(f"  time box   {args.max_minutes} min")
+        say(f"  log        {log_path}")
+        if not check_firmware_served(args.firmware_url):
+            say("  ✗ firmware not served correctly, not flashing anything")
+            rc = 1
+        elif args.lan_only:
+            rc = run_lan_only(args)
+        else:
+            rc = run_tray(args)
+        sys.stdout.close_log()
 
-    if args.lan_only:
-        return run_lan_only(args)
-    return run_tray(args)
-
+        if not interactive:
+            return rc
+        if not ask_next_tray():
+            return rc
+        args.expected = None  # ask again, defaulting to the last size
 
 def run_lan_only(args) -> int:
     """Recovery path: flash whatever Tasmota is on the LAN (or the given IPs)."""
@@ -745,6 +863,10 @@ def run_tray(args) -> int:
         say(f"    Tasmota already on the LAN, not tray members: {sorted(on_lan) or '-'}")
         say(f"    modern units in BLE range, not tray members: {sorted(modern_before) or '-'}")
     if len(aps) != args.expected:
+        banner([
+            f"NIET GESTART:  {len(aps)} stekkers gezien, {args.expected} verwacht.",
+            "Controleer of alle stekkers stroom hebben en probeer opnieuw.",
+        ])
         say(f"    ✗ TRAY MISMATCH: {len(aps)} visible, {args.expected} expected. Nothing touched.")
         if args.expected == EXPECTED_TRAY_SIZE:
             say(f"      {EXPECTED_TRAY_SIZE} is the default tray size. For a different tray pass --expected N,")
@@ -854,13 +976,20 @@ def run_tray(args) -> int:
         say(f"    {mark} {tray[b]:<13} {state}")
     if len(verified) != len(tray):
         missing = sorted(tray[b] for b in set(tray) - verified)
-        say("")
-        say(f"    ✗ NOT COMPLETE: {', '.join(missing)} not verified. Nothing on this tray")
-        say(f"      is ready until this says {len(tray)}/{len(tray)}. Power-cycle those plugs and")
-        say(f"      run again with --expected {len(missing)}, or --lan-only if they sit on the LAN.")
+        banner([
+            f"NIET KLAAR:  {len(verified)} van {len(tray)} stekkers gereed.",
+            "DEZE TRAY MAG NIET DOOR.",
+            "",
+            "Niet gelukt: " + ", ".join(missing),
+            "",
+            "Haal deze stekkers uit de tray, steek ze opnieuw in,",
+            f"en start opnieuw met  {len(missing)}  als aantal.",
+        ])
         return 1
-    say("")
-    say("    ✓ COMPLETE, the tray can go")
+    banner([
+        f"KLAAR:  {len(tray)} van {len(tray)} stekkers gereed in {minutes:.1f} minuten.",
+        "DEZE TRAY KAN DOOR.",
+    ])
     return 0
 
 if __name__ == "__main__":
