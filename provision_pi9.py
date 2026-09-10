@@ -54,6 +54,33 @@ import provision_pi8 as p8
 # at exit: over ssh the whole run is otherwise invisible until it is over.
 sys.stdout.reconfigure(line_buffering=True)
 
+
+class _Stamped:
+    """Prefix every line with a wall-clock time so a log can be timed later."""
+
+    def __init__(self, raw):
+        self._raw = raw
+        self._at_line_start = True
+
+    def write(self, text):
+        out = []
+        for chunk in text.splitlines(keepends=True):
+            if self._at_line_start and chunk.strip():
+                out.append(time.strftime("%H:%M:%S ") + chunk)
+            else:
+                out.append(chunk)
+            self._at_line_start = chunk.endswith("\n")
+        self._raw.write("".join(out))
+
+    def flush(self):
+        self._raw.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+sys.stdout = _Stamped(sys.stdout)
+
 # -------- Configurable constants --------
 
 # The modern bin, served by nginx on this Pi (see setup_firmware_server.sh).
@@ -81,6 +108,10 @@ MAX_RUN_MINUTES_PER_PLUG = 1.0
 
 # Between convergence passes that found nothing new to do.
 PASS_IDLE_SECONDS = 20
+
+# LAN sweep parallelism. 254 hosts at a 3 s probe timeout take ~64 s with
+# pi8's 16 workers and ~16 s with 64; the probes themselves are unchanged.
+SWEEP_WORKERS = 64
 
 # A plug whose flash was sent but that keeps answering as Tasmota is retried
 # this many times (from safeboot, OtaUrl + Upgrade again does work).
@@ -133,6 +164,27 @@ def sta_mac_for_bssid(bssid: str) -> str:
     n = int(bssid.replace(":", "").replace("-", ""), 16) - 1
     h = f"{n:012X}"
     return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+def scan_tray_aps(fresh: bool) -> List[Dict[str, str]]:
+    """
+    AccuSaver APs as pi8 sees them, optionally from NetworkManager's cache.
+    pi8's connect_wifi_to_ap does its own fresh rescan right before joining,
+    so the pass loop only needs a cheap look to pick a target; a fresh scan
+    costs several seconds with a tray's worth of APs in the air.
+    """
+    result = p8.run_cmd([
+        "nmcli", "-f", "SSID,BSSID,CHAN,SIGNAL", "device", "wifi", "list",
+        "ifname", p8.WIFI_INTERFACE, "--rescan", "yes" if fresh else "auto",
+    ])
+    seen: Set[str] = set()
+    aps: List[Dict[str, str]] = []
+    for ap in p8.parse_wifi_scan(result.stdout):
+        if ap["bssid"] not in seen:
+            seen.add(ap["bssid"])
+            aps.append(ap)
+    aps.sort(key=lambda a: int(a["signal"]), reverse=True)
+    return aps
 
 
 def check_firmware_served(url: str) -> bool:
@@ -221,14 +273,14 @@ def set_ota_url(ip: str, url: str, max_retries: int = 3) -> bool:
 
 
 def wait_for_tasmota_gone(
-    ip: str, timeout_s: int = FLASH_TIMEOUT_SECONDS, poll_s: float = 5.0
+    ip: str, timeout_s: int = FLASH_TIMEOUT_SECONDS, poll_s: float = 3.0
 ) -> bool:
     """
     A successful migration takes the unit OFF the LAN: the modern firmware boots
     with an empty WiFi config. So the Tasmota endpoint going quiet — and staying
     quiet — is our LAN-side signal. Confirmation comes from the BLE scan.
 
-    Requires four consecutive silent polls (~35 s of silence), because a stock
+    Requires four consecutive silent polls (~24 s of silence), because a stock
     Tasmota unit drops or delays individual requests even when healthy — two
     silent polls in a row happen without any flash at all.
     """
@@ -237,7 +289,7 @@ def wait_for_tasmota_gone(
     while time.time() < deadline:
         try:
             resp = requests.get(
-                f"http://{ip}/cm", params={"cmnd": "Status 5"}, timeout=4
+                f"http://{ip}/cm", params={"cmnd": "Status 5"}, timeout=3
             )
             silent = 0 if resp.status_code == 200 else silent + 1
         except Exception:
@@ -364,7 +416,7 @@ def run_phase_a_pass(tray_bssids: Set[str], skip_bssids: Set[str]) -> List[str]:
     empty_scans = 0
 
     while True:
-        visible = p8.scan_accusaver_aps()
+        visible = scan_tray_aps(fresh=False)
         candidates = [
             ap for ap in visible
             if ap["bssid"].upper() in tray_bssids and ap["bssid"].upper() not in visited
@@ -373,7 +425,7 @@ def run_phase_a_pass(tray_bssids: Set[str], skip_bssids: Set[str]) -> List[str]:
             empty_scans += 1
             if empty_scans >= PHASE_A_EMPTY_SCANS:
                 break
-            time.sleep(5)
+            time.sleep(3)
             continue
         empty_scans = 0
 
@@ -430,7 +482,8 @@ def discover_devices(
         prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
         # 3 s per probe instead of pi8's 1 s: see get_device_mac for why.
         found = p8.find_all_devices_by_scan(
-            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST, timeout_seconds=3.0
+            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST,
+            timeout_seconds=3.0, max_workers=SWEEP_WORKERS,
         )
         ips = sorted(found.keys())
 
@@ -540,7 +593,8 @@ def run_tray(args) -> int:
     aps = p8.scan_accusaver_aps()
     prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
     on_lan = p8.find_all_devices_by_scan(
-        prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST, timeout_seconds=3.0
+        prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST,
+        timeout_seconds=3.0, max_workers=SWEEP_WORKERS,
     )
     modern_before = scan_ble_accusavers(args.ble_seconds)
     if on_lan:
@@ -630,7 +684,7 @@ def run_tray(args) -> int:
             time.sleep(PASS_IDLE_SECONDS)
 
     # Final state for the report: one last look at what is still out there.
-    still_ap = {ap["bssid"].upper() for ap in p8.scan_accusaver_aps()}
+    still_ap = {ap["bssid"].upper() for ap in scan_tray_aps(fresh=True)}
     final_ble = scan_ble_accusavers(max(args.ble_seconds, 25)) if (set(tray) - verified) else set()
     for b in set(tray) - verified:
         if tray[b] in final_ble:
