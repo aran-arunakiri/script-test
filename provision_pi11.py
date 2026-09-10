@@ -208,8 +208,7 @@ def _flash_tally() -> None:
     done = sum(1 for x in st if x.startswith("✓"))
     bad = sum(1 for x in st if x.startswith("✗"))
     busy = max(0, sent - done - bad)
-    tally("B", f"flashing {busy}", f"off the LAN {done}/{len(_ip_names)}",
-          f"mislukt {bad}", progress=(done, len(_ip_names), "off the LAN"))
+    tally("B", f"flashing {busy}", f"mislukt {bad}", progress=(done, len(_ip_names), "off the LAN"))
 
 
 def _status_line(ip: str, status: str) -> None:
@@ -746,8 +745,8 @@ def run_phase_a_pass(
             visited.add(target["bssid"].upper())
             plug_line(name, "✗ could not join its access point", f"after {t_join:.0f} s: {why}; retry later")
             if tray:
-                tally("A", f"provisioned {provisioned_before + len(provisioned)}",
-                      f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
+                tally("A",
+                      (f"on the LAN {on_lan_count}/{len(tray)}" if swept else f"provisioned {provisioned_before + len(provisioned)}"),
                       f"{len(candidates) - 1} AP(s) still visible",
                       progress=((on_lan_count, len(tray), "on the LAN") if swept else (provisioned_before + len(provisioned), len(tray), "provisioned")))
             continue
@@ -765,9 +764,9 @@ def run_phase_a_pass(
         plug_line(name, "provisioned",
                   f"{time.time() - t_plug:.0f} s  (join {t_join:.0f} · cmd {t_cmd:.0f})")
         if tray:
-            tally("A", f"provisioned {provisioned_before + len(provisioned)}",
-                  f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
-                      f"{len(candidates) - 1} AP(s) still visible",
+            tally("A",
+                  (f"on the LAN {on_lan_count}/{len(tray)}" if swept else f"provisioned {provisioned_before + len(provisioned)}"),
+                  f"{len(candidates) - 1} AP(s) still visible",
                   progress=((on_lan_count, len(tray), "on the LAN") if swept else (provisioned_before + len(provisioned), len(tray), "provisioned")))
 
     return provisioned
@@ -1058,8 +1057,7 @@ def run_tray(args) -> int:
             last_seen[ap_bssid_for_mac(mac)] = f"on the LAN at {ip}"
         have = {ap_bssid_for_mac(m) for m in on_lan.values()}
         still = set(tray) - have
-        tally("A", f"on the LAN {len(have)}/{len(tray)}",
-              ("waiting for " + ", ".join(sorted(tray[b] for b in still))) if still else "all present",
+        tally("A", ("waiting for " + ", ".join(sorted(tray[b] for b in still))) if still else "all present",
               progress=(len(have), len(tray), "on the LAN"))
         if still and not provisioned:
             time.sleep(JOIN_POLL_SECONDS)
@@ -1105,8 +1103,7 @@ def run_tray(args) -> int:
             if b in flashed - verified and served.get(ip):
                 last_seen[b] = (f"full download logged by the Pi ({served[ip]} B) and left the LAN, "
                                 "but not seen over BLE — power it near the Pi and scan")
-    tally("C", f"verified {len(verified)}/{len(tray)}",
-          ("missing " + ", ".join(sorted(tray[b] for b in set(tray) - verified))) if len(verified) < len(tray) else "all advertising",
+    tally("C", ("missing " + ", ".join(sorted(tray[b] for b in set(tray) - verified))) if len(verified) < len(tray) else "all advertising",
           progress=(len(verified), len(tray), "verified"))
 
     # ---- Report ----
