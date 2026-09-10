@@ -276,6 +276,11 @@ PHASE_A_EMPTY_SCANS = 3
 MAX_RUN_MINUTES_BASE = 10
 MAX_RUN_MINUTES_PER_PLUG = 1.0
 
+# After provisioning, wait this long before the first sweep; later sweeps
+# follow anyway until every plug is on the LAN, so this only sets the
+# earliest moment a fast joiner can be picked up.
+JOIN_WAIT_SECONDS = 10
+
 # While waiting for provisioned plugs to appear on the LAN, look again this often.
 JOIN_POLL_SECONDS = 10
 
@@ -905,8 +910,8 @@ def run_tray(args) -> int:
         for b in provisioned:
             last_seen[b] = "provisioned, never joined the WiFi"
         if provisioned:
-            say(f"    waiting 20 s for {len(provisioned)} plug(s) to join the WiFi")
-            time.sleep(20)
+            say(f"    waiting {JOIN_WAIT_SECONDS} s for {len(provisioned)} plug(s) to join the WiFi")
+            time.sleep(JOIN_WAIT_SECONDS)
         found = discover_devices(None, only_bssids=list(missing))
         swept_once = True
         for ip, mac in found.items():
