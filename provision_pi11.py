@@ -1,12 +1,17 @@
 """
-provision_pi9.py — batch-flash a tray of factory AccuSavers from Tasmota to the
+provision_pi11.py — batch-flash a tray of factory AccuSavers from Tasmota to the
 modern (ESP-IDF) firmware, leaving every unit UNPROVISIONED and ready to ship.
+
+pi11 = pi9 (2026-09-10) with the timing work: own AP join (no rescan, no
+separate contact check), ARP-based discovery of the tray's MACs instead of a
+254-host HTTP sweep, NetworkManager autoconnect disabled for plug APs, BLE
+scanned immediately, shorter silence windows. Same decisions as pi9.
 
 Relationship to provision_pi8.py
 --------------------------------
 pi8 is the last confirmed-working Tasmota -> Tasmota flow and is NOT copied
 here — it is imported, so every primitive (AP scanning, WiFi handling, Phase A, the LAN
-sweep, Upgrade with retries) is literally the same code. pi9 only:
+sweep, Upgrade with retries) is literally the same code. pi11 only:
 
   * points OtaUrl at accusaver.bin instead of the Tasmota bin
   * drops the steps that cannot survive the migration
@@ -32,11 +37,11 @@ step.
 
 Usage
 -----
-  python3 provision_pi9.py                 # full run: Phase A + B + C
-  python3 provision_pi9.py --lan-only      # skip Phase A (units already on WiFi)
-  python3 provision_pi9.py --lan-only --ips 192.168.0.61
-  python3 provision_pi9.py --ble-only      # just report which ACCU_ units advertise
-  python3 provision_pi9.py --dry-run       # everything except the actual Upgrade
+  python3 provision_pi11.py                 # full run: Phase A + B + C
+  python3 provision_pi11.py --lan-only      # skip Phase A (units already on WiFi)
+  python3 provision_pi11.py --lan-only --ips 192.168.0.61
+  python3 provision_pi11.py --ble-only      # just report which ACCU_ units advertise
+  python3 provision_pi11.py --dry-run       # everything except the actual Upgrade
 """
 
 import argparse
@@ -222,6 +227,29 @@ p8.print = _pi8_filtered_print
 p8.update_status = _status_line
 p8.run_cmd = _run_cmd_with_assoc_timeout
 
+
+def disable_ap_autoconnect() -> None:
+    """
+    NetworkManager keeps a profile per SSID it has joined and, by default,
+    reconnects to it on its own. With every plug advertising "accusaver" that
+    meant wlan0 wandering onto whichever plug it liked between our steps, and
+    our explicit join to a specific BSSID then timing out. Once, persistent.
+    """
+    import subprocess
+    out = subprocess.run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        name, _, typ = line.partition(":")
+        if "wireless" not in typ:
+            continue
+        ssid = subprocess.run(["nmcli", "-g", "802-11-wireless.ssid", "connection", "show", name],
+                              capture_output=True, text=True).stdout.strip()
+        auto = subprocess.run(["nmcli", "-g", "connection.autoconnect", "connection", "show", name],
+                              capture_output=True, text=True).stdout.strip()
+        if ssid.lower().startswith("accusaver") and auto != "no":
+            subprocess.run(["nmcli", "connection", "modify", name, "connection.autoconnect", "no"],
+                           capture_output=True)
+
 # -------- Configurable constants --------
 
 # The modern bin, served by nginx on this Pi (see setup_firmware_server.sh).
@@ -267,7 +295,7 @@ EXPECTED_MODERN_VERSION = "1.0.8"
 BLE_SCAN_SECONDS = 15
 
 # Phase A stops after this many consecutive scans without an unvisited AP.
-PHASE_A_EMPTY_SCANS = 3
+PHASE_A_EMPTY_SCANS = 2
 
 # The whole run keeps converging on the tray for at most this long: a fixed
 # part plus one minute per plug (Phase A alone costs ~30 s per plug, and a
@@ -287,6 +315,9 @@ JOIN_POLL_SECONDS = 10
 # Reserve this much of the time box for flashing + verification; the rest is
 # for getting every plug onto the LAN.
 FLASH_AND_VERIFY_MINUTES = 3
+
+# How long the Pi's ping sweep waits per host when locating tray plugs by MAC.
+PING_TIMEOUT_S = 1
 
 # How long the Pi tries to associate with a plug's access point. A plug that
 # already holds credentials is mid-way onto the office WiFi and never lets us
@@ -324,7 +355,7 @@ p8.FIRMWARE_URL = MODERN_FIRMWARE_URL
 # alike. Identify ourselves honestly instead. Only the pre-flight talks to
 # that host; pi8's own calls go to the Pi and are left untouched.
 _http = requests.Session()
-_http.headers["User-Agent"] = "AccuSaver-provision/pi9"
+_http.headers["User-Agent"] = "AccuSaver-provision/pi11"
 
 
 
@@ -351,6 +382,35 @@ def sta_mac_for_bssid(bssid: str) -> str:
     n = int(bssid.replace(":", "").replace("-", ""), 16) - 1
     h = f"{n:012X}"
     return ":".join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+def join_ap(ssid: str, bssid: str) -> Tuple[bool, str]:
+    """
+    Join one specific plug access point. Unlike pi8's connect this does not
+    rescan first (the caller just listed the APs) and does not run a separate
+    HTTP contact check (the credentials command is the contact). Returns
+    (joined, reason).
+    """
+    import subprocess
+    p8.disconnect_wifi()
+    subprocess.run(["ip", "addr", "flush", "dev", p8.WIFI_INTERFACE], capture_output=True)
+    cmd = ["nmcli", "-w", str(ASSOCIATION_TIMEOUT_S), "device", "wifi", "connect", ssid,
+           "bssid", bssid, "ifname", p8.WIFI_INTERFACE]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 and "No network with SSID" in (r.stderr + r.stdout):
+        # NetworkManager's cache lost the AP; one fresh scan, one more try.
+        subprocess.run(["nmcli", "device", "wifi", "list", "ifname", p8.WIFI_INTERFACE,
+                        "--rescan", "yes"], capture_output=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout).strip().splitlines()[-1:] and (r.stderr or r.stdout).strip().splitlines()[-1] or "nmcli failed"
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        ip = p8.get_current_ip(p8.WIFI_INTERFACE)
+        if ip and ip.startswith("192.168.4."):
+            return True, ip
+        time.sleep(0.5)
+    return False, "joined but got no 192.168.4.x address"
 
 
 def scan_tray_aps(fresh: bool) -> List[Dict[str, str]]:
@@ -497,7 +557,7 @@ def wait_for_tasmota_gone(
     with an empty WiFi config. So the Tasmota endpoint going quiet — and staying
     quiet — is our LAN-side signal. Confirmation comes from the BLE scan.
 
-    Requires four consecutive silent polls (~24 s of silence), because a stock
+    Requires three consecutive silent polls (~15 s of silence), because a stock
     Tasmota unit drops or delays individual requests even when healthy — two
     silent polls in a row happen without any flash at all.
     """
@@ -511,7 +571,7 @@ def wait_for_tasmota_gone(
             silent = 0 if resp.status_code == 200 else silent + 1
         except Exception:
             silent += 1
-        if silent >= 4:
+        if silent >= 3:
             return True
         time.sleep(poll_s)
     return False
@@ -646,7 +706,7 @@ def run_phase_a_pass(
             empty_scans += 1
             if empty_scans >= PHASE_A_EMPTY_SCANS:
                 break
-            time.sleep(3)
+            time.sleep(2)
             continue
         empty_scans = 0
 
@@ -654,31 +714,21 @@ def run_phase_a_pass(
         name = ble_name_for_mac(sta_mac_for_bssid(target["bssid"])) or target["bssid"]
         t_plug = time.time()
 
-        # pi8 connects with a fixed SSID and excludes by BSSID; steer it onto
-        # exactly this AP by naming its SSID and excluding every other one.
-        p8.TASMOTA_AP_SSID = target["ssid"]
-        exclude = [ap["bssid"] for ap in visible if ap["bssid"] != target["bssid"]]
         t_join = time.time()
-        connected_bssid = p8.connect_wifi_to_ap(exclude_bssids=exclude)
+        joined, why = join_ap(target["ssid"], target["bssid"])
         t_join = time.time() - t_join
+        connected_bssid = target["bssid"] if joined else None
         if connected_bssid is None:
             # Count it as visited for this pass so one flaky AP cannot stall
             # the pass; a later pass gets another go at it.
             visited.add(target["bssid"].upper())
-            plug_line(name, "✗ could not join its access point", f"gave up after {t_join:.0f} s, retry later")
+            plug_line(name, "✗ could not join its access point", f"after {t_join:.0f} s: {why}; retry later")
             if tray:
                 tally("A", f"provisioned {provisioned_before + len(provisioned)}",
                       f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
                       f"{len(candidates) - 1} AP(s) still visible")
             continue
         visited.add(connected_bssid.upper())
-
-        t_contact = time.time()
-        if not p8.ensure_ap_http():
-            plug_line(name, "✗ joined but no HTTP answer", "retry later")
-            p8.disconnect_wifi()
-            continue
-        t_contact = time.time() - t_contact
 
         t_cmd = time.time()
         if not p8.send_phase1_commands(router_ssid, router_password):
@@ -690,13 +740,58 @@ def run_phase_a_pass(
         p8.disconnect_wifi()
         provisioned.append(connected_bssid.upper())
         plug_line(name, "provisioned",
-                  f"{time.time() - t_plug:.0f} s  (join {t_join:.0f} · contact {t_contact:.0f} · cmd {t_cmd:.0f})")
+                  f"{time.time() - t_plug:.0f} s  (join {t_join:.0f} · cmd {t_cmd:.0f})")
         if tray:
             tally("A", f"provisioned {provisioned_before + len(provisioned)}",
                   f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
                       f"{len(candidates) - 1} AP(s) still visible")
 
     return provisioned
+
+
+def arp_discover(prefix: str, wanted_macs: Set[str]) -> Dict[str, str]:
+    """
+    ip -> mac for the wanted station MACs, found by pinging the /24 and
+    reading the Pi's neighbour table. ~5 s for 254 hosts, and it does not
+    depend on the plug's erratic HTTP server. Identity comes from ARP, which
+    is authoritative for a MAC.
+    """
+    import subprocess
+
+    def ping(h: int) -> None:
+        subprocess.run(["ping", "-c", "1", "-W", str(PING_TIMEOUT_S), f"{prefix}{h}"],
+                       capture_output=True)
+
+    with ThreadPoolExecutor(max_workers=64) as ex:
+        list(ex.map(ping, range(p8.SCAN_START_HOST, p8.SCAN_END_HOST + 1)))
+    out = subprocess.run(["ip", "neigh", "show", "dev", p8.LAN_INTERFACE],
+                         capture_output=True, text=True).stdout
+    found: Dict[str, str] = {}
+    for line in out.splitlines():
+        if "lladdr" not in line or "FAILED" in line or "INCOMPLETE" in line:
+            continue
+        parts = line.split()
+        ip, mac = parts[0], parts[parts.index("lladdr") + 1].upper()
+        if mac in wanted_macs:
+            found[ip] = mac
+    return found
+
+
+def discover_tray_members(prefix: str, missing_bssids: Set[str]) -> Dict[str, str]:
+    """ARP first; the slow HTTP sweep only if ARP found nothing at all."""
+    wanted = {sta_mac_for_bssid(b) for b in missing_bssids}
+    found = arp_discover(prefix, wanted)
+    if found:
+        # Confirm each is a live Tasmota answering HTTP (retries inside).
+        confirmed: Dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(found)) as ex:
+            for ip, mac in zip(found, ex.map(get_device_mac, found)):
+                if mac and mac.upper() == found[ip]:
+                    confirmed[ip] = mac
+                elif VERBOSE:
+                    say(f"    {ip} is in ARP as {found[ip]} but does not answer Status 5 yet")
+        return confirmed
+    return discover_devices(None, only_bssids=list(missing_bssids))
 
 
 def discover_devices(
@@ -776,6 +871,7 @@ def main() -> int:
     p8.STRICT_SSID_MATCH = False
     if args.firmware_url is None:
         args.firmware_url = default_firmware_url()
+    disable_ap_autoconnect()
     p8.FIRMWARE_URL = args.firmware_url  # Phase A sends this as OtaUrl
 
     if args.ble_only:
@@ -896,6 +992,7 @@ def run_tray(args) -> int:
     t0 = time.time()
     join_deadline = t0 + max(60, (args.max_minutes - FLASH_AND_VERIFY_MINUTES) * 60)
     last_seen: Dict[str, str] = {}
+    prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
 
     # ---- Phase A: get every tray member onto the LAN ----
     phase("PHASE A", "provisioning over the access points until every plug is on the LAN")
@@ -919,7 +1016,7 @@ def run_tray(args) -> int:
         if provisioned:
             say(f"    waiting {JOIN_WAIT_SECONDS} s for {len(provisioned)} plug(s) to join the WiFi")
             time.sleep(JOIN_WAIT_SECONDS)
-        found = discover_devices(None, only_bssids=list(missing))
+        found = discover_tray_members(prefix, missing)
         swept_once = True
         for ip, mac in found.items():
             on_lan[ip] = mac
@@ -955,9 +1052,8 @@ def run_tray(args) -> int:
                         else f"flash from {ip} did not take; still answering as Tasmota")
 
     # ---- Phase C: verify, once (plus one scan for late boots) ----
-    phase("PHASE C", "BLE verification (15 s for the plugs to boot, then scan)")
-    time.sleep(15)
-    advertising = scan_ble_accusavers(args.ble_seconds)
+    phase("PHASE C", "BLE verification")
+    advertising = scan_ble_accusavers(max(args.ble_seconds, 20))
     verified = {b for b in flashed if tray[b] in advertising}
     if flashed - verified:
         say(f"    {len(flashed - verified)} not advertising yet, one more scan in 10 s")
