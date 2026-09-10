@@ -106,16 +106,20 @@ PHASE_A_EMPTY_SCANS = 3
 MAX_RUN_MINUTES_BASE = 10
 MAX_RUN_MINUTES_PER_PLUG = 1.0
 
-# Between convergence passes that found nothing new to do.
-PASS_IDLE_SECONDS = 20
+# While waiting for provisioned plugs to appear on the LAN, look again this often.
+JOIN_POLL_SECONDS = 10
+
+# Reserve this much of the time box for flashing + verification; the rest is
+# for getting every plug onto the LAN.
+FLASH_AND_VERIFY_MINUTES = 3
 
 # LAN sweep parallelism. 254 hosts at a 3 s probe timeout take ~64 s with
 # pi8's 16 workers and ~16 s with 64; the probes themselves are unchanged.
 SWEEP_WORKERS = 64
 
-# A plug whose flash was sent but that keeps answering as Tasmota is retried
-# this many times (from safeboot, OtaUrl + Upgrade again does work).
-MAX_FLASH_ATTEMPTS = 3
+# A plug whose flash was sent but that keeps answering as Tasmota gets one
+# immediate retry (from safeboot, OtaUrl + Upgrade again does work).
+MAX_FLASH_ATTEMPTS = 2
 
 # A production tray. The run refuses to start unless it can account for exactly
 # this many plugs, and refuses to report success unless exactly this many are
@@ -457,7 +461,6 @@ def run_phase_a_pass(tray_bssids: Set[str], skip_bssids: Set[str]) -> List[str]:
             p8.disconnect_wifi()
             continue
 
-        time.sleep(2)
         p8.disconnect_wifi()
         provisioned.append(connected_bssid.upper())
         print(f"✓ PHASE A: provisioned {connected_bssid}\n")
@@ -521,6 +524,9 @@ def main() -> int:
         help="where the modern bin is served (version.txt is looked up next to it)",
     )
     parser.add_argument("--ble-seconds", type=int, default=BLE_SCAN_SECONDS)
+    parser.add_argument("--survey", action="store_true",
+                        help="also sweep the LAN and scan BLE at pre-flight and print "
+                             "what else is around (informational, +40 s)")
     parser.add_argument("--max-minutes", type=int, default=None,
                         help="give up converging on the tray after this long "
                              "(default: 10 + 1 per plug)")
@@ -583,131 +589,132 @@ def run_lan_only(args) -> int:
 
 def run_tray(args) -> int:
     """
-    The production path. Pre-flight fixes the tray as the set of Tasmota APs
-    visible right now (exactly --expected of them, or we do not start). Then
-    converge: provision visible tray APs, pick up tray members on the LAN
-    however they got there, flash, verify over BLE, repeat until every member
-    is verified or the time box runs out. The report is per tray member.
+    The production path, as one straight line:
+
+      pre-flight  exactly --expected Tasmota APs visible, or we do not start
+      phase A     provision every tray AP; keep provisioning any tray AP that
+                  comes back (a plug that missed its first WiFi join) until
+                  every tray member is on the LAN or the join time box expires
+      phase B     flash everything on the LAN, once (a flash that does not
+                  take gets one immediate retry)
+      phase C     verify over BLE, once (with one extra scan for late boots)
+      report      per tray member; success only at N/N
+
+    Tray membership is by AP BSSID from pre-flight. A plug that already had
+    credentials and joined the LAN by itself is a member like any other; a
+    Tasmota that was never a tray AP is never touched.
     """
-    print("=== PRE-FLIGHT: a clean tray shows exactly one Tasmota AP per plug ===")
-    aps = p8.scan_accusaver_aps()
-    prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
-    on_lan = p8.find_all_devices_by_scan(
-        prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST,
-        timeout_seconds=3.0, max_workers=SWEEP_WORKERS,
-    )
-    modern_before = scan_ble_accusavers(args.ble_seconds)
-    if on_lan:
-        print(f"\n⚠️  Tasmota already on the LAN (not part of this tray): {sorted(on_lan)}")
-    if modern_before:
-        print(f"⚠️  Modern units in BLE range (not part of this tray): {sorted(modern_before)}")
+    print("=== PRE-FLIGHT ===")
+    aps = scan_tray_aps(fresh=True)
+    print(f"  Tasmota access points: {len(aps)}")
+    if args.survey:
+        prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
+        on_lan = p8.find_all_devices_by_scan(
+            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST,
+            timeout_seconds=3.0, max_workers=SWEEP_WORKERS,
+        )
+        modern_before = scan_ble_accusavers(args.ble_seconds)
+        print(f"  Tasmota already on the LAN (not tray members): {sorted(on_lan) or '-'}")
+        print(f"  Modern units in BLE range (not tray members): {sorted(modern_before) or '-'}")
     if len(aps) != args.expected:
         print(f"\n✗ Tray mismatch: {len(aps)} Tasmota AP(s) visible, expected "
               f"{args.expected}. Not touching anything.")
         print("   Missing plugs: no power, out of WiFi range of the Pi, or not "
-              "factory-fresh (see warnings above). For a half-done tray use "
-              "--lan-only --expected N.")
+              "factory-fresh. For a half-done tray use --lan-only --expected N.")
         return 1
 
-    # The tray, by AP BSSID. Everything below is keyed on this set.
     tray: Dict[str, str] = {}  # bssid -> expected BLE name
     for ap in aps:
         b = ap["bssid"].upper()
         tray[b] = ble_name_for_mac(sta_mac_for_bssid(b)) or "?"
-    print(f"\n✓ Pre-flight: {len(tray)} AccuSaver AP(s), tray is clean")
-    print("  " + ", ".join(sorted(tray.values())) + "\n")
+    print(f"✓ Tray: {len(tray)} plug(s) — " + ", ".join(sorted(tray.values())) + "\n")
 
-    verified: Set[str] = set()          # bssid
-    flashed_pending: Set[str] = set()   # flashed + off LAN, awaiting BLE
-    attempts: Dict[str, int] = {}       # bssid -> flash attempts
-    last_seen: Dict[str, str] = {}      # bssid -> last observed state
-    deadline = time.time() + args.max_minutes * 60
-    pass_no = 0
+    t0 = time.time()
+    join_deadline = t0 + max(60, (args.max_minutes - FLASH_AND_VERIFY_MINUTES) * 60)
+    last_seen: Dict[str, str] = {}
 
+    # ---- Phase A: get every tray member onto the LAN ----
+    print("=== PHASE A: provisioning until every plug is on the LAN ===")
+    on_lan: Dict[str, str] = {}  # ip -> mac, tray members only
     while True:
-        remaining = {b for b in tray if b not in verified}
-        if not remaining:
+        have = {ap_bssid_for_mac(m) for m in on_lan.values()}
+        missing = set(tray) - have
+        if not missing:
             break
-        if pass_no >= 1 and time.time() > deadline:
-            print(f"\n⏱  Time box of {args.max_minutes} min reached.")
+        if time.time() > join_deadline:
+            print(f"\n⏱  Join time box reached with {len(missing)} plug(s) not on the LAN.")
             break
-        pass_no += 1
-        print(f"\n########## PASS {pass_no}: {len(verified)}/{len(tray)} verified, "
-              f"{len(remaining)} to go, {int((deadline - time.time()) / 60)} min left ##########")
-
-        # A) provision tray APs that are visible now and not yet flashed
-        to_provision = remaining - flashed_pending
-        provisioned = run_phase_a_pass(to_provision, skip_bssids=set())
+        provisioned = run_phase_a_pass(missing, skip_bssids=set())
         for b in provisioned:
-            last_seen[b] = "provisioned, waiting for it to join WiFi"
+            last_seen[b] = "provisioned, never joined the WiFi"
         if provisioned:
-            print(f"Pass {pass_no}: provisioned {len(provisioned)}; waiting 20s for WiFi join...")
+            print(f"Provisioned {len(provisioned)}; waiting 20s for WiFi join...")
             time.sleep(20)
-
-        # B) pick up tray members on the LAN, however they got there
-        print(f"\n=== DISCOVERY (pass {pass_no}) ===")
-        lan_targets = {b for b in remaining - flashed_pending if attempts.get(b, 0) < MAX_FLASH_ATTEMPTS}
-        devices = discover_devices(None, only_bssids=list(lan_targets)) if lan_targets else {}
-        for ip, mac in devices.items():
+        found = discover_devices(None, only_bssids=list(missing))
+        for ip, mac in found.items():
+            on_lan[ip] = mac
             last_seen[ap_bssid_for_mac(mac)] = f"on the LAN at {ip}"
+        have = {ap_bssid_for_mac(m) for m in on_lan.values()}
+        still = set(tray) - have
+        print(f"  {len(have)}/{len(tray)} on the LAN"
+              + (f"; waiting for {sorted(tray[b] for b in still)}" if still else ""))
+        if still and not provisioned:
+            time.sleep(JOIN_POLL_SECONDS)
 
-        # C) flash them
-        if devices:
-            print(f"\n=== PHASE B (pass {pass_no}): flashing {len(devices)} ===")
-            results = flash_batch(devices, args.dry_run)
-            for ip, ok in results.items():
-                b = ap_bssid_for_mac(devices[ip])
-                attempts[b] = attempts.get(b, 0) + 1
-                if ok:
-                    flashed_pending.add(b)
-                    last_seen[b] = f"flashed from {ip}, left the LAN, awaiting BLE"
-                else:
-                    last_seen[b] = f"flash attempt {attempts[b]} from {ip} did not take"
-            if args.dry_run:
-                print("\n(dry run — stopping after one pass)")
-                return 0
+    if not on_lan:
+        print("\n✗ Nothing reached the LAN. Not flashing anything.")
+        return 1
 
-        # D) verify over BLE
-        if flashed_pending:
-            print(f"\n=== PHASE C (pass {pass_no}): BLE verification ===")
-            time.sleep(15 if devices else 0)
-            advertising = scan_ble_accusavers(args.ble_seconds)
-            for b in list(flashed_pending):
-                if tray[b] in advertising:
-                    verified.add(b)
-                    flashed_pending.discard(b)
-                    last_seen[b] = "verified over BLE"
+    # ---- Phase B: flash, once ----
+    print(f"\n=== PHASE B: flashing {len(on_lan)} ===")
+    p8.device_status.clear()
+    results = flash_batch(on_lan, args.dry_run)
+    if args.dry_run:
+        print("\n(dry run — no Upgrade sent, stopping here)")
+        return 0
+    retry = {ip: mac for ip, mac in on_lan.items() if not results.get(ip)}
+    if retry and MAX_FLASH_ATTEMPTS > 1:
+        print(f"\n  {len(retry)} flash(es) did not take; one immediate retry...")
+        p8.device_status.clear()
+        results.update(flash_batch(retry, False))
+    flashed = {ap_bssid_for_mac(mac) for ip, mac in on_lan.items() if results.get(ip)}
+    for ip, mac in on_lan.items():
+        b = ap_bssid_for_mac(mac)
+        last_seen[b] = (f"flashed from {ip}, left the LAN" if results.get(ip)
+                        else f"flash from {ip} did not take; still answering as Tasmota")
 
-        did_something = bool(provisioned or devices)
-        if not did_something and (set(tray) - verified):
-            print(f"Pass {pass_no}: nothing new yet; polling again in {PASS_IDLE_SECONDS}s")
-            time.sleep(PASS_IDLE_SECONDS)
+    # ---- Phase C: verify, once (plus one scan for late boots) ----
+    print("\n=== PHASE C: BLE verification ===")
+    time.sleep(15)
+    advertising = scan_ble_accusavers(args.ble_seconds)
+    verified = {b for b in flashed if tray[b] in advertising}
+    if flashed - verified:
+        print(f"  {len(flashed - verified)} not advertising yet; one more scan...")
+        time.sleep(10)
+        advertising |= scan_ble_accusavers(max(args.ble_seconds, 25))
+        verified = {b for b in flashed if tray[b] in advertising}
+    for b in verified:
+        last_seen[b] = "verified over BLE"
 
-    # Final state for the report: one last look at what is still out there.
-    still_ap = {ap["bssid"].upper() for ap in scan_tray_aps(fresh=True)}
-    final_ble = scan_ble_accusavers(max(args.ble_seconds, 25)) if (set(tray) - verified) else set()
-    for b in set(tray) - verified:
-        if tray[b] in final_ble:
-            verified.add(b)
-            last_seen[b] = "verified over BLE (final scan)"
-        elif b in still_ap:
-            last_seen[b] = "still a Tasmota access point: " + last_seen.get(b, "never provisioned")
-
+    # ---- Report ----
+    still_ap = {ap["bssid"].upper() for ap in scan_tray_aps(fresh=True)} if len(verified) < len(tray) else set()
     print("\n=== RESULT ===")
     for b in sorted(tray, key=lambda x: tray[x]):
         mark = "✓" if b in verified else "✗"
-        print(f"  {mark} {tray[b]}  (AP {b})  {last_seen.get(b, 'never seen on the LAN')}")
-    print(f"\n{len(verified)}/{len(tray)} unit(s) ready to ship "
-          f"after {pass_no} pass(es).")
+        state = last_seen.get(b, "never seen")
+        if b not in verified and b in still_ap:
+            state = "still a Tasmota access point (" + state + ")"
+        print(f"  {mark} {tray[b]}  (AP {b})  {state}")
+    minutes = (time.time() - t0) / 60
+    print(f"\n{len(verified)}/{len(tray)} unit(s) ready to ship in {minutes:.1f} min.")
     if len(verified) != len(tray):
         missing = sorted(tray[b] for b in set(tray) - verified)
         print(f"\n✗ NOT COMPLETE. Not verified: {missing}. Nothing on this tray is "
               f"ready until this says {len(tray)}/{len(tray)}. Power-cycle the "
-              "listed plugs and run again with --expected "
-              f"{len(missing)} (or --lan-only if they sit on the LAN).")
+              f"listed plugs and run again with --expected {len(missing)} "
+              "(or --lan-only if they sit on the LAN).")
         return 1
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
