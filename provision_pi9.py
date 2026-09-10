@@ -72,6 +72,11 @@ BLE_SCAN_SECONDS = 15
 # Phase A stops after this many consecutive scans without an unvisited AP.
 PHASE_A_EMPTY_SCANS = 4
 
+# A production tray. The run refuses to start unless it can account for exactly
+# this many plugs, and refuses to report success unless exactly this many are
+# ready to ship — the factory must never be left guessing which ones failed.
+EXPECTED_TRAY_SIZE = 30
+
 # How long a unit may take to download, flash and reboot before we call it lost.
 FLASH_TIMEOUT_SECONDS = 180
 
@@ -307,6 +312,7 @@ def run_phase_a(expected_devices: Optional[int]) -> int:
     router_password = config["password"]
 
     p8.AP_EXCLUSION_ENABLED = True
+    p8.STRICT_SSID_MATCH = False  # one plug on the first tray advertised plain "accusaver"
 
     provisioned = 0
     visited_bssids: List[str] = []
@@ -318,6 +324,13 @@ def run_phase_a(expected_devices: Optional[int]) -> int:
         print(f" PHASE A: device #{provisioned + 1} of {target}")
         print("==============================================\n")
 
+        # pi8 connects with a fixed SSID; point it at the SSID of the strongest
+        # unvisited AP so a plug with a non-default AP name still gets joined.
+        candidates = [
+            ap for ap in p8.scan_accusaver_aps() if ap["bssid"] not in visited_bssids
+        ]
+        if candidates:
+            p8.TASMOTA_AP_SSID = max(candidates, key=lambda a: int(a["signal"]))["ssid"]
         connected_bssid = p8.connect_wifi_to_ap(exclude_bssids=visited_bssids)
         if connected_bssid is None:
             empty_scans += 1
@@ -386,9 +399,10 @@ def main() -> int:
     # pi8 ships EXPECTED_DEVICES = 3, which is a test-batch value; a production
     # tray is 18. Keep the real number as the default rather than inheriting it.
     parser.add_argument(
-        "--expected", type=int, default=None,
-        help="tray size; if given, pre-flight insists on exactly this many APs "
-             "and Phase A stops after that many. Default: drain every AP seen.",
+        "--expected", type=int, default=EXPECTED_TRAY_SIZE,
+        help="tray size; pre-flight refuses to start unless APs + Tasmota on the "
+             "LAN + already-modern units in BLE range add up to exactly this, and "
+             "the run only reports success with exactly this many ready to ship",
     )
     parser.add_argument(
         "--firmware-url", default=MODERN_FIRMWARE_URL,
@@ -413,19 +427,34 @@ def main() -> int:
     print("=== TASMOTA -> MODERN BATCH MIGRATION ===\n")
     print(f"Firmware : {firmware_url}")
     print(f"Expected : {EXPECTED_MODERN_VERSION}")
-    print(f"Tray size: {args.expected if args.expected else 'drain all visible APs'}\n")
+    print(f"Tray size: {args.expected}\n")
 
     if not check_firmware_served(firmware_url):
         print("\n✗ Pre-flight failed — not flashing anything.")
         return 1
 
+    already_modern: Set[str] = set()
     if not args.lan_only:
-        detected = p8.scan_accusaver_aps()
-        if args.expected is not None and len(detected) != args.expected:
-            print(f"\n✗ AP count mismatch: saw {len(detected)}, expected {args.expected}")
+        print("=== PRE-FLIGHT: accounting for every plug on the tray ===")
+        p8.STRICT_SSID_MATCH = False
+        aps = p8.scan_accusaver_aps()
+        prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
+        on_lan = p8.find_all_devices_by_scan(
+            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST, timeout_seconds=3.0
+        )
+        already_modern = scan_ble_accusavers(args.ble_seconds)
+        total = len(aps) + len(on_lan) + len(already_modern)
+        print(f"\n  Tasmota access points : {len(aps)}")
+        print(f"  Tasmota on the LAN    : {len(on_lan)}  {sorted(on_lan) or ''}")
+        print(f"  Already modern (BLE)  : {len(already_modern)}  {sorted(already_modern) or ''}")
+        print(f"  Total accounted for   : {total}  (expected {args.expected})")
+        if total != args.expected:
+            print(f"\n✗ Tray mismatch: {total} plug(s) accounted for, expected {args.expected}. "
+                  "Not touching anything. Check power/range of the missing ones, "
+                  "or pass --expected if the tray really is a different size.")
             return 1
-        print(f"\n✓ Pre-flight: {len(detected)} AccuSaver AP(s) detected\n")
-        done = run_phase_a(args.expected)
+        print("\n✓ Pre-flight: tray fully accounted for\n")
+        done = run_phase_a(None)
         print(f"\nPhase A provisioned {done} AP(s)")
         print("Waiting 20s for devices to join WiFi...")
         time.sleep(20)
@@ -478,8 +507,19 @@ def main() -> int:
         print(f"\n  note: {len(unexpected)} other AccuSaver(s) in BLE range: "
               f"{sorted(unexpected)}")
 
-    print(f"\n{ok_count}/{len(devices)} unit(s) ready to ship.")
-    return 0 if ok_count == len(devices) else 1
+    shipped = ok_count + len(already_modern)
+    print(f"\n{ok_count}/{len(devices)} flashed unit(s) verified"
+          + (f", plus {len(already_modern)} already modern" if already_modern else "")
+          + f" = {shipped}/{args.expected} ready to ship.")
+    if shipped != args.expected:
+        failed = [f"{ip} ({ble_name_for_mac(devices[ip])})" for ip in sorted(devices)
+                  if not (results.get(ip) and ble_name_for_mac(devices[ip]) in advertising)]
+        print(f"\n✗ NOT COMPLETE. Failed: {failed or '-'}; "
+              f"unaccounted: {args.expected - shipped - len(failed)}. "
+              "Re-run for the rest; nothing is ready until this says "
+              f"{args.expected}/{args.expected}.")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
