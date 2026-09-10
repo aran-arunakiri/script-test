@@ -69,6 +69,9 @@ EXPECTED_MODERN_VERSION = "1.0.8"
 
 BLE_SCAN_SECONDS = 15
 
+# Phase A stops after this many consecutive scans without an unvisited AP.
+PHASE_A_EMPTY_SCANS = 4
+
 # How long a unit may take to download, flash and reboot before we call it lost.
 FLASH_TIMEOUT_SECONDS = 180
 
@@ -284,46 +287,66 @@ def flash_device_to_modern(
 # -------- Phases --------
 
 
-def run_phase_a(expected_devices: int) -> int:
+def run_phase_a(expected_devices: Optional[int]) -> int:
     """
-    Unchanged from pi6 apart from the bin it points at: a factory unit is still
-    Tasmota, still has an AP, and we still need it on WiFi to reach it.
+    Walk every AccuSaver access point we can see and push WiFi + OtaUrl into it.
+
+    Two things learned on the first 30-plug tray (2026-09-10) shape this:
+
+    * A plug keeps its AP up for a while AFTER it has joined the office WiFi, so
+      "strongest AP first, no memory" (pi8's default) provisions the same plug
+      over and over. Every BSSID is therefore visited exactly once.
+    * Trays are mixed: some plugs already carry credentials and never show an
+      AP at all. So an exact AP count is not a useful gate. Without --expected
+      this phase simply drains the APs it can see and stops when a few scans in
+      a row show nothing left; Discovery then picks up everything Tasmota on
+      the LAN regardless of how it got there.
     """
     config = p8.load_config()
     router_ssid = config["ssid"]
     router_password = config["password"]
 
-    provisioned = 0
-    provisioned_bssids: List[str] = []
+    p8.AP_EXCLUSION_ENABLED = True
 
-    while provisioned < expected_devices:
+    provisioned = 0
+    visited_bssids: List[str] = []
+    empty_scans = 0
+    target = str(expected_devices) if expected_devices else "all visible"
+
+    while expected_devices is None or provisioned < expected_devices:
         print("\n==============================================")
-        print(f" PHASE A: device #{provisioned + 1} of {expected_devices}")
+        print(f" PHASE A: device #{provisioned + 1} of {target}")
         print("==============================================\n")
 
-        connected_bssid = None
-        while connected_bssid is None:
-            connected_bssid = p8.connect_wifi_to_ap(exclude_bssids=provisioned_bssids)
-            if connected_bssid is None:
-                print("✗ Could not connect to AP, retrying in 3 seconds...")
-                time.sleep(3)
+        connected_bssid = p8.connect_wifi_to_ap(exclude_bssids=visited_bssids)
+        if connected_bssid is None:
+            empty_scans += 1
+            if empty_scans >= PHASE_A_EMPTY_SCANS:
+                print(f"✓ No unvisited AccuSaver AP in {empty_scans} scans — Phase A done")
+                break
+            print(f"  (no connectable unvisited AP, {empty_scans}/{PHASE_A_EMPTY_SCANS}; retrying in 5s)")
+            time.sleep(5)
+            continue
+        empty_scans = 0
+
+        # Never come back to this AP, whatever happens next: a plug that keeps
+        # its AP up after joining WiFi would otherwise eat every slot.
+        visited_bssids.append(connected_bssid)
 
         if not p8.ensure_ap_http():
             print("✗ AP unreachable, skipping this device...\n")
+            p8.disconnect_wifi()
             continue
 
         if not p8.send_phase1_commands(router_ssid, router_password):
             print("✗ Phase 1 failed, skipping this device...\n")
+            p8.disconnect_wifi()
             continue
-
-        ip = p8.get_current_ip(p8.WIFI_INTERFACE)
-        if ip and ip.startswith("192.168.4."):
-            provisioned_bssids.append(connected_bssid)
 
         time.sleep(2)
         p8.disconnect_wifi()
         provisioned += 1
-        print(f"✓ PHASE A: {provisioned}/{expected_devices} AP-provisioned\n")
+        print(f"✓ PHASE A: {provisioned}/{target} AP-provisioned ({connected_bssid})\n")
 
     return provisioned
 
@@ -362,7 +385,11 @@ def main() -> int:
     parser.add_argument("--ips", nargs="*", help="target these IPs instead of scanning")
     # pi8 ships EXPECTED_DEVICES = 3, which is a test-batch value; a production
     # tray is 18. Keep the real number as the default rather than inheriting it.
-    parser.add_argument("--expected", type=int, default=18, help="tray size")
+    parser.add_argument(
+        "--expected", type=int, default=None,
+        help="tray size; if given, pre-flight insists on exactly this many APs "
+             "and Phase A stops after that many. Default: drain every AP seen.",
+    )
     parser.add_argument(
         "--firmware-url", default=MODERN_FIRMWARE_URL,
         help="where the modern bin is served (version.txt is looked up next to it)",
@@ -380,7 +407,7 @@ def main() -> int:
     print("=== TASMOTA -> MODERN BATCH MIGRATION ===\n")
     print(f"Firmware : {firmware_url}")
     print(f"Expected : {EXPECTED_MODERN_VERSION}")
-    print(f"Tray size: {args.expected}\n")
+    print(f"Tray size: {args.expected if args.expected else 'drain all visible APs'}\n")
 
     if not check_firmware_served(firmware_url):
         print("\n✗ Pre-flight failed — not flashing anything.")
@@ -388,11 +415,12 @@ def main() -> int:
 
     if not args.lan_only:
         detected = p8.scan_accusaver_aps()
-        if len(detected) != args.expected:
+        if args.expected is not None and len(detected) != args.expected:
             print(f"\n✗ AP count mismatch: saw {len(detected)}, expected {args.expected}")
             return 1
         print(f"\n✓ Pre-flight: {len(detected)} AccuSaver AP(s) detected\n")
-        run_phase_a(args.expected)
+        done = run_phase_a(args.expected)
+        print(f"\nPhase A provisioned {done} AP(s)")
         print("Waiting 20s for devices to join WiFi...")
         time.sleep(20)
 
