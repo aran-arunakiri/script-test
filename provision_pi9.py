@@ -395,6 +395,11 @@ def main() -> int:
         help="where the modern bin is served (version.txt is looked up next to it)",
     )
     parser.add_argument("--ble-seconds", type=int, default=BLE_SCAN_SECONDS)
+    parser.add_argument(
+        "--ap-ssid", default=p8.TASMOTA_AP_SSID,
+        help="exact SSID of the plugs' access point (one plug on the first 30-tray "
+             "advertised plain 'accusaver' instead of the factory name)",
+    )
     args = parser.parse_args()
 
     if args.ble_only:
@@ -403,6 +408,7 @@ def main() -> int:
 
     firmware_url = args.firmware_url
     p8.FIRMWARE_URL = firmware_url  # Phase A sends this as OtaUrl
+    p8.TASMOTA_AP_SSID = args.ap_ssid  # both the scan filter and nmcli connect use it
 
     print("=== TASMOTA -> MODERN BATCH MIGRATION ===\n")
     print(f"Firmware : {firmware_url}")
