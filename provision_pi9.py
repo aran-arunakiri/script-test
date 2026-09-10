@@ -139,16 +139,28 @@ def check_firmware_served(url: str) -> bool:
     return True
 
 
-def get_device_mac(ip: str, timeout_s: float = 3.0) -> Optional[str]:
-    """Read a Tasmota unit's MAC via Status 5, so we know its future BLE name."""
-    try:
-        resp = requests.get(
-            f"http://{ip}/cm", params={"cmnd": "Status 5"}, timeout=timeout_s
-        )
-        if resp.status_code == 200:
-            return resp.json().get("StatusNET", {}).get("Mac")
-    except Exception:
-        pass
+def get_device_mac(ip: str, timeout_s: float = 6.0, attempts: int = 3) -> Optional[str]:
+    """
+    Read a Tasmota unit's MAC via Status 5, so we know its future BLE name.
+
+    Stock Tasmota on a freshly reset unit answers erratically: three replies in
+    0.1 s, then one that takes 4 s or never comes (measured in the factory on
+    2026-09-10). One 3 s try missed a unit that was demonstrably up, so give it
+    a few generous tries before declaring it absent.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(
+                f"http://{ip}/cm", params={"cmnd": "Status 5"}, timeout=timeout_s
+            )
+            if resp.status_code == 200:
+                mac = resp.json().get("StatusNET", {}).get("Mac")
+                if mac:
+                    return mac
+        except Exception:
+            pass
+        if attempt < attempts:
+            time.sleep(2)
     return None
 
 
@@ -176,20 +188,21 @@ def wait_for_tasmota_gone(
     with an empty WiFi config. So the Tasmota endpoint going quiet — and staying
     quiet — is our LAN-side signal. Confirmation comes from the BLE scan.
 
-    Requires two consecutive silent polls, so a single dropped request during
-    the flash is not mistaken for success.
+    Requires four consecutive silent polls (~35 s of silence), because a stock
+    Tasmota unit drops or delays individual requests even when healthy — two
+    silent polls in a row happen without any flash at all.
     """
     deadline = time.time() + timeout_s
     silent = 0
     while time.time() < deadline:
         try:
             resp = requests.get(
-                f"http://{ip}/cm", params={"cmnd": "Status 5"}, timeout=3
+                f"http://{ip}/cm", params={"cmnd": "Status 5"}, timeout=4
             )
             silent = 0 if resp.status_code == 200 else silent + 1
         except Exception:
             silent += 1
-        if silent >= 2:
+        if silent >= 4:
             return True
         time.sleep(poll_s)
     return False
@@ -317,8 +330,9 @@ def discover_devices(explicit_ips: Optional[List[str]]) -> Dict[str, str]:
         ips = explicit_ips
     else:
         prefix = p8.detect_lan_prefix(p8.LAN_INTERFACE)
+        # 3 s per probe instead of pi8's 1 s: see get_device_mac for why.
         found = p8.find_all_devices_by_scan(
-            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST
+            prefix, p8.SCAN_START_HOST, p8.SCAN_END_HOST, timeout_seconds=3.0
         )
         ips = sorted(found.keys())
 
