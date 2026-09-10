@@ -191,8 +191,10 @@ FLASH_AND_VERIFY_MINUTES = 3
 # How long the Pi tries to associate with a plug's access point. A plug that
 # already holds credentials is mid-way onto the office WiFi and never lets us
 # in; NetworkManager would otherwise wait ~28 s per such plug. It turns up on
-# the LAN by itself, so give up early.
-ASSOCIATION_TIMEOUT_S = 12
+# the LAN by itself, so give up early — but not too early: on 2026-09-10 a
+# 12 s cap made two perfectly fresh plugs miss their first association
+# (normal is 2–4 s, outliers need more) and cost a retry round.
+ASSOCIATION_TIMEOUT_S = 20
 
 # LAN sweep parallelism. 254 hosts at a 3 s probe timeout take ~64 s with
 # pi8's 16 workers and ~16 s with 64; the probes themselves are unchanged.
@@ -506,7 +508,7 @@ def flash_batch(devices: Dict[str, str], dry_run: bool) -> Dict[str, bool]:
 def run_phase_a_pass(
     tray_bssids: Set[str], skip_bssids: Set[str],
     tray: Optional[Dict[str, str]] = None, on_lan_count: int = 0,
-    provisioned_before: int = 0,
+    provisioned_before: int = 0, swept: bool = True,
 ) -> List[str]:
     """
     One pass: push WiFi + OtaUrl into every currently visible AP that belongs
@@ -564,7 +566,8 @@ def run_phase_a_pass(
             plug_line(name, "✗ could not join its access point", "retry later")
             if tray:
                 tally("A", f"provisioned {provisioned_before + len(provisioned)}",
-                      f"on the LAN {on_lan_count}/{len(tray)}", f"{len(candidates) - 1} AP(s) still visible")
+                      f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
+                      f"{len(candidates) - 1} AP(s) still visible")
             continue
         visited.add(connected_bssid.upper())
 
@@ -583,7 +586,8 @@ def run_phase_a_pass(
         plug_line(name, "provisioned", f"{time.time() - t_plug:.0f} s")
         if tray:
             tally("A", f"provisioned {provisioned_before + len(provisioned)}",
-                  f"on the LAN {on_lan_count}/{len(tray)}", f"{len(candidates) - 1} AP(s) still visible")
+                  f"on the LAN {on_lan_count}/{len(tray)}" + ("" if swept else " (not swept yet)"),
+                      f"{len(candidates) - 1} AP(s) still visible")
 
     return provisioned
 
@@ -760,6 +764,7 @@ def run_tray(args) -> int:
     phase("PHASE A", "provisioning over the access points until every plug is on the LAN")
     on_lan: Dict[str, str] = {}  # ip -> mac, tray members only
     provisioned_total = 0
+    swept_once = False
     while True:
         have = {ap_bssid_for_mac(m) for m in on_lan.values()}
         missing = set(tray) - have
@@ -769,7 +774,8 @@ def run_tray(args) -> int:
             say(f"    ⏱ join time box reached, {len(missing)} plug(s) never reached the LAN")
             break
         provisioned = run_phase_a_pass(missing, skip_bssids=set(), tray=tray,
-                                       on_lan_count=len(have), provisioned_before=provisioned_total)
+                                       on_lan_count=len(have), provisioned_before=provisioned_total,
+                                       swept=swept_once)
         provisioned_total += len(provisioned)
         for b in provisioned:
             last_seen[b] = "provisioned, never joined the WiFi"
@@ -777,6 +783,7 @@ def run_tray(args) -> int:
             say(f"    waiting 20 s for {len(provisioned)} plug(s) to join the WiFi")
             time.sleep(20)
         found = discover_devices(None, only_bssids=list(missing))
+        swept_once = True
         for ip, mac in found.items():
             on_lan[ip] = mac
             last_seen[ap_bssid_for_mac(mac)] = f"on the LAN at {ip}"
